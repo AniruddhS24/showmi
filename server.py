@@ -6,15 +6,21 @@ import uvicorn
 from browser_use import Agent
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from browser_use.llm.anthropic.chat import ChatAnthropic as BrowserUseChatAnthropic
 from browser_use.llm.openai.chat import ChatOpenAI as BrowserUseChatOpenAI
+from pydantic import BaseModel
 
 from agent import _make_browser
 from config import config as default_config
-from db import add_message, create_session, init_db
+from db import (
+    add_message, create_session, init_db,
+    list_sessions, get_session_messages,
+    list_models, get_active_model, save_model, set_active_model, delete_model,
+)
 from hooks import load_skills
 
-app = FastAPI(title="Stockholm Browser Agent")
+app = FastAPI(title="Showmi Browser Agent")
 
 app.add_middleware(
     CORSMiddleware,
@@ -34,6 +40,92 @@ async def startup():
 async def health():
     return {"status": "ok"}
 
+
+# ── REST: Sessions ──
+
+@app.get("/api/sessions")
+async def api_list_sessions():
+    return list_sessions()
+
+
+@app.get("/api/sessions/{session_id}/messages")
+async def api_session_messages(session_id: str):
+    return get_session_messages(session_id)
+
+
+# ── REST: Models ──
+
+class ModelPayload(BaseModel):
+    id: str | None = None
+    name: str = ""
+    provider: str = "anthropic"
+    api_key: str = ""
+    base_url: str = ""
+    model: str = ""
+    temperature: float = 0.5
+
+
+@app.get("/api/models")
+async def api_list_models():
+    models = list_models()
+    # Mask API keys in response (show last 4 chars only)
+    for m in models:
+        key = m.get("api_key", "")
+        m["api_key_preview"] = ("..." + key[-4:]) if len(key) > 4 else ("*" * len(key))
+        del m["api_key"]
+    return models
+
+
+@app.get("/api/models/active")
+async def api_active_model():
+    m = get_active_model()
+    if not m:
+        return JSONResponse(status_code=404, content={"error": "No active model"})
+    key = m.get("api_key", "")
+    m["api_key_preview"] = ("..." + key[-4:]) if len(key) > 4 else ("*" * len(key))
+    del m["api_key"]
+    return m
+
+
+@app.post("/api/models")
+async def api_save_model(payload: ModelPayload):
+    data = payload.model_dump()
+    result = save_model(data)
+    # If this is the only model, make it active
+    all_models = list_models()
+    if len(all_models) == 1:
+        set_active_model(result["id"])
+    return {"ok": True, "id": result["id"]}
+
+
+@app.put("/api/models/{model_id}")
+async def api_update_model(model_id: str, payload: ModelPayload):
+    data = payload.model_dump()
+    data["id"] = model_id
+    # If api_key is empty, preserve the existing one
+    if not data["api_key"]:
+        existing = list_models()
+        for m in existing:
+            if m["id"] == model_id:
+                data["api_key"] = m["api_key"]
+                break
+    save_model(data)
+    return {"ok": True}
+
+
+@app.put("/api/models/{model_id}/activate")
+async def api_activate_model(model_id: str):
+    set_active_model(model_id)
+    return {"ok": True}
+
+
+@app.delete("/api/models/{model_id}")
+async def api_delete_model(model_id: str):
+    delete_model(model_id)
+    return {"ok": True}
+
+
+# ── WebSocket agent ──
 
 def _make_step_hook(ws: WebSocket, session_id: str):
     """Create on_step_start and on_step_end hooks that stream updates via WebSocket."""
@@ -57,7 +149,6 @@ def _make_step_hook(ws: WebSocket, session_id: str):
         except Exception:
             pass
 
-        # Also print to console like the original hooks
         print(f"\n{'='*60}")
         print(f"Step {step}")
         print(f"{'='*60}")
@@ -75,7 +166,6 @@ def _make_step_hook(ws: WebSocket, session_id: str):
                 action_data = action.model_dump(exclude_none=True)
                 action_names.append(action_data)
 
-        # Print results to console (reuse original hooks logic)
         for i, r in enumerate(results):
             action_label = str(action_names[i]) if i < len(action_names) else "action"
             if r.error:
@@ -87,7 +177,6 @@ def _make_step_hook(ws: WebSocket, session_id: str):
             if r.extracted_content:
                 print(f"         → {r.extracted_content[:150]}")
 
-        # Current URL
         url = "unknown"
         try:
             url = await agent.browser_session.get_current_page_url()
@@ -95,7 +184,6 @@ def _make_step_hook(ws: WebSocket, session_id: str):
             pass
         print(f"URL: {url}")
 
-        # Build actions list for the WebSocket message
         actions = []
         for i, r in enumerate(results):
             actions.append({
@@ -121,7 +209,6 @@ def _make_step_hook(ws: WebSocket, session_id: str):
         except Exception:
             pass
 
-        # Save step data to DB
         add_message(session_id, "assistant", json.dumps(msg), metadata=msg)
 
     return on_step_start, on_step_end
@@ -130,7 +217,6 @@ def _make_step_hook(ws: WebSocket, session_id: str):
 async def run_agent_ws(task: str, ws: WebSocket, session_id: str, settings: dict) -> None:
     """Run the browser-use agent, streaming updates over a WebSocket."""
 
-    # Override config values from settings if provided
     cfg = default_config
     provider = settings.get("provider", "local")
     if settings.get("api_key"):
@@ -154,7 +240,6 @@ async def run_agent_ws(task: str, ws: WebSocket, session_id: str, settings: dict
             api_key=cfg.llm_api_key,
         )
     else:
-        # OpenAI-compatible (including local models)
         llm = BrowserUseChatOpenAI(
             base_url=cfg.llm_base_url,
             model=cfg.llm_model,
@@ -185,7 +270,6 @@ async def run_agent_ws(task: str, ws: WebSocket, session_id: str, settings: dict
         on_step_end=on_step_end,
     )
 
-    # Build and send final result
     result_msg = {
         "type": "result",
         "summary": history.final_result() or "",
@@ -194,7 +278,6 @@ async def run_agent_ws(task: str, ws: WebSocket, session_id: str, settings: dict
     }
     await ws.send_json(result_msg)
 
-    # Save final result to DB
     add_message(
         session_id,
         "assistant",
@@ -236,14 +319,27 @@ async def websocket_endpoint(ws: WebSocket):
                 await ws.send_json({"type": "error", "message": "Empty task content"})
                 continue
 
-            # Prepend active tab context if available
+            # If no settings provided, use the active model from DB
+            if not settings.get("api_key"):
+                active = get_active_model()
+                if active:
+                    settings = {
+                        "provider": active["provider"],
+                        "model": active["model"],
+                        "base_url": active["base_url"],
+                        "api_key": active["api_key"],
+                        "temperature": active["temperature"],
+                    }
+
             task = content
             if active_tab and active_tab.get("url"):
                 task = f"[User is currently on: {active_tab['url']} — \"{active_tab.get('title', '')}\"]\n\n{content}"
 
-            # Create session and save user message
             session_id = create_session(title=content[:120])
             add_message(session_id, "user", content)
+
+            # Send session_id back so frontend can track it
+            await ws.send_json({"type": "session", "session_id": session_id})
 
             try:
                 await run_agent_ws(task, ws, session_id, settings)

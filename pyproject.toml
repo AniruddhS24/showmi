@@ -1,5 +1,5 @@
 [project]
-name = "stockholm"
+name = "showmi"
 version = "0.1.0"
 description = "Local browser automation agent using browser-use"
 requires-python = ">=3.11"
@@ -17,4 +17,4 @@ dependencies = [
 py-modules = ["main", "agent", "config", "hooks", "db", "server"]
 
 [project.scripts]
-stockholm = "main:cli"
+showmi = "main:cli"

@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "Stockholm",
+  "name": "Showmi",
   "version": "0.1.0",
   "description": "Browser automation agent sidebar",
   "minimum_chrome_version": "114",
@@ -17,6 +17,6 @@
     "service_worker": "background.js"
   },
   "action": {
-    "default_title": "Open Stockholm"
+    "default_title": "Open Showmi"
   }
 }

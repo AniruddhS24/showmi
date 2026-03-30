@@ -4,15 +4,16 @@ from pathlib import Path
 
 from config import config
 
-LOGS_DIR = Path(__file__).parent / "logs"
-SKILLS_DIR = Path(__file__).parent / "skills"
+from db import SHOWMI_DIR, LOGS_DIR
+
+WORKFLOWS_DIR = SHOWMI_DIR / "workflows"
 
 
 def load_skills() -> str:
-    """Read all .md files from skills/ and return concatenated content."""
-    if not SKILLS_DIR.exists():
+    """Read all .md files from ~/.self-learning-browseragent/workflows/ and return concatenated content."""
+    if not WORKFLOWS_DIR.exists():
         return ""
-    skill_files = sorted(SKILLS_DIR.glob("*.md"))
+    skill_files = sorted(WORKFLOWS_DIR.glob("*.md"))
     if not skill_files:
         return ""
     parts = []
