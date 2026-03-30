@@ -1086,6 +1086,164 @@ body {
 
 #send-btn:disabled { opacity: 0.2; cursor: default; }
 
+/* ═══════════════════════════════════════
+   RECORDING CONTROLS
+   ═══════════════════════════════════════ */
+
+.record-controls {
+  display: flex;
+  gap: 5px;
+  margin-bottom: 6px;
+}
+
+.btn-record {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: transparent;
+  color: var(--text-muted);
+  border: 1px dotted var(--border-dot);
+  padding: 4px 8px;
+  font-family: var(--font);
+  font-size: 10px;
+  font-weight: 500;
+  border-radius: var(--r-sm);
+  cursor: pointer;
+  transition: all var(--duration);
+}
+
+.btn-record:hover {
+  color: var(--error);
+  border-color: var(--error);
+}
+
+.record-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--error);
+  flex-shrink: 0;
+}
+
+.btn-stop {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: transparent;
+  color: var(--error);
+  border: 1px solid var(--error);
+  padding: 4px 8px;
+  font-family: var(--font);
+  font-size: 10px;
+  font-weight: 500;
+  border-radius: var(--r-sm);
+  cursor: pointer;
+  transition: all var(--duration);
+}
+
+.btn-stop:hover {
+  background: rgba(248, 81, 73, 0.08);
+}
+
+.stop-icon {
+  width: 6px;
+  height: 6px;
+  background: var(--error);
+  border-radius: 1px;
+  flex-shrink: 0;
+}
+
+.event-count {
+  font-size: 9px;
+  color: var(--text-dim);
+  margin-left: 2px;
+}
+
+.btn-stop.hidden,
+.btn-record.hidden {
+  display: none;
+}
+
+/* Recording active state — pulsing top border */
+.recording-active #input-area {
+  border-top: 1px solid var(--error);
+  animation: recPulse 1.5s infinite;
+}
+
+@keyframes recPulse {
+  0%, 100% { border-top-color: var(--error); }
+  50% { border-top-color: transparent; }
+}
+
+.recording-active .record-dot {
+  animation: pulse 1.2s infinite;
+}
+
+
+/* ═══════════════════════════════════════
+   WORKFLOW REVIEW OVERLAY
+   ═══════════════════════════════════════ */
+
+.wf-steps {
+  padding: 6px 8px;
+  background: var(--bg-elevated);
+  border: 1px dotted var(--border);
+  border-radius: var(--r-sm);
+  font-size: 11px;
+  color: var(--text);
+  line-height: 1.7;
+  max-height: 300px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+}
+
+.wf-steps::-webkit-scrollbar { width: 3px; }
+.wf-steps::-webkit-scrollbar-track { background: transparent; }
+.wf-steps::-webkit-scrollbar-thumb { background: var(--scrollbar); }
+
+.wf-params {
+  margin-bottom: 8px;
+}
+
+.wf-params-title {
+  font-size: 9px;
+  font-weight: 500;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  margin-bottom: 4px;
+}
+
+.wf-param-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 6px;
+  font-size: 10px;
+  color: var(--text-muted);
+  background: var(--bg-elevated);
+  border: 1px dotted var(--border);
+  border-radius: var(--r-sm);
+  margin-bottom: 3px;
+}
+
+.wf-param-name {
+  color: var(--accent-text);
+  font-weight: 500;
+}
+
+.wf-error {
+  padding: 6px 8px;
+  border-left: 2px solid var(--error);
+  color: var(--error);
+  font-size: 10px;
+  margin-bottom: 8px;
+}
+
+.wf-error.hidden { display: none; }
+
+
 /* ── Reduced motion ── */
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {

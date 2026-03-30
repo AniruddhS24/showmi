@@ -653,6 +653,196 @@ function autoResizeInput() {
 
 sendBtn.addEventListener("click", sendMessage);
 
+// ── Recording ──
+
+const recordBtn = document.getElementById("record-btn");
+const stopBtn = document.getElementById("stop-btn");
+const eventCountEl = document.getElementById("event-count");
+
+// Workflow review overlay
+const workflowReview = document.getElementById("workflow-review");
+const reviewClose = document.getElementById("review-close");
+const wfNameInput = document.getElementById("wf-name");
+const wfDescInput = document.getElementById("wf-description");
+const wfParamsEl = document.getElementById("wf-params");
+const wfStepsEl = document.getElementById("wf-steps");
+const wfErrorEl = document.getElementById("wf-error");
+const reviewDiscard = document.getElementById("review-discard");
+const reviewSave = document.getElementById("review-save");
+
+let isRecording = false;
+let compiledWorkflow = null;
+
+// Start recording
+recordBtn.addEventListener("click", () => {
+  chrome.runtime.sendMessage({ type: "START_RECORDING" }, (response) => {
+    if (response?.ok) {
+      isRecording = true;
+      recordBtn.classList.add("hidden");
+      stopBtn.classList.remove("hidden");
+      eventCountEl.textContent = "0";
+      document.body.classList.add("recording-active");
+      inputEl.disabled = true;
+      inputEl.placeholder = "recording...";
+      sendBtn.disabled = true;
+    }
+  });
+});
+
+// Stop recording
+stopBtn.addEventListener("click", () => {
+  chrome.runtime.sendMessage({ type: "STOP_RECORDING" }, async (data) => {
+    isRecording = false;
+    stopBtn.classList.add("hidden");
+    recordBtn.classList.remove("hidden");
+    document.body.classList.remove("recording-active");
+
+    if (!data || !data.events || data.events.length === 0) {
+      addMessage("error", "No events were recorded.");
+      updateInputState();
+      return;
+    }
+
+    // Hide empty state
+    if (emptyStateEl) emptyStateEl.style.display = "none";
+
+    addMessage("system", `Compiling ${data.events.length} recorded events...`);
+    showThinking();
+
+    try {
+      const res = await fetch(`${API_BASE}/api/workflows/compile`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: "Untitled Workflow",
+          description: "",
+          auto_parameterize: true,
+          recording: {
+            start_url: data.startUrl,
+            events: data.events,
+          },
+        }),
+      });
+
+      removeThinking();
+
+      if (!res.ok) {
+        const err = await res.json();
+        addMessage("error", err.error || "Compilation failed");
+        updateInputState();
+        return;
+      }
+
+      const result = await res.json();
+      compiledWorkflow = result.workflow;
+      showWorkflowReview(compiledWorkflow);
+    } catch (e) {
+      removeThinking();
+      addMessage("error", `Compilation error: ${e.message}`);
+      updateInputState();
+    }
+  });
+});
+
+// Live event count from background
+chrome.runtime.onMessage.addListener((msg) => {
+  if (msg.type === "RECORDING_EVENT_COUNT" && isRecording) {
+    eventCountEl.textContent = String(msg.count);
+  }
+});
+
+// ── Workflow review overlay ──
+
+function showWorkflowReview(workflow) {
+  wfNameInput.value = workflow.name || "";
+  wfDescInput.value = workflow.description || "";
+  wfErrorEl.classList.add("hidden");
+
+  // Render parameters
+  const params = workflow.parameters || [];
+  if (params.length) {
+    wfParamsEl.innerHTML = '<div class="wf-params-title">parameters</div>';
+    params.forEach((p) => {
+      const item = document.createElement("div");
+      item.className = "wf-param-item";
+      item.innerHTML = `<span class="wf-param-name">{{${escapeHtml(p.name)}}}</span> ${escapeHtml(p.description || "")}`;
+      wfParamsEl.appendChild(item);
+    });
+  } else {
+    wfParamsEl.innerHTML = "";
+  }
+
+  // Render steps (body markdown)
+  wfStepsEl.innerHTML = renderMarkdown(workflow.body || "");
+
+  workflowReview.classList.remove("hidden");
+}
+
+function hideWorkflowReview() {
+  workflowReview.classList.add("hidden");
+  compiledWorkflow = null;
+  updateInputState();
+}
+
+reviewClose.addEventListener("click", hideWorkflowReview);
+reviewDiscard.addEventListener("click", hideWorkflowReview);
+
+workflowReview.addEventListener("click", (e) => {
+  if (e.target === workflowReview) hideWorkflowReview();
+});
+
+reviewSave.addEventListener("click", async () => {
+  if (!compiledWorkflow) return;
+
+  const name = wfNameInput.value.trim() || compiledWorkflow.name;
+  const description = wfDescInput.value.trim() || compiledWorkflow.description;
+
+  try {
+    reviewSave.disabled = true;
+    reviewSave.textContent = "saving...";
+
+    const res = await fetch(`${API_BASE}/api/workflows`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        name,
+        description,
+        parameters: compiledWorkflow.parameters,
+        body: compiledWorkflow.body,
+      }),
+    });
+
+    if (res.status === 409) {
+      wfErrorEl.textContent = "A workflow with this name already exists. Change the name.";
+      wfErrorEl.classList.remove("hidden");
+      reviewSave.disabled = false;
+      reviewSave.textContent = "save workflow";
+      return;
+    }
+
+    if (!res.ok) {
+      const err = await res.json();
+      wfErrorEl.textContent = err.error || "Save failed";
+      wfErrorEl.classList.remove("hidden");
+      reviewSave.disabled = false;
+      reviewSave.textContent = "save workflow";
+      return;
+    }
+
+    // Success
+    workflowReview.classList.add("hidden");
+    compiledWorkflow = null;
+    addMessage("system", `Workflow "${name}" saved.`);
+    updateInputState();
+  } catch (e) {
+    wfErrorEl.textContent = `Error: ${e.message}`;
+    wfErrorEl.classList.remove("hidden");
+  } finally {
+    reviewSave.disabled = false;
+    reviewSave.textContent = "save workflow";
+  }
+});
+
 // ── Init ──
 initTheme();
 fetchModels();

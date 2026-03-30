@@ -179,8 +179,50 @@
     </div>
   </main>
 
+  <!-- ── Workflow review overlay ── -->
+  <div id="workflow-review" class="overlay hidden">
+    <div class="overlay-panel">
+      <div class="overlay-header">
+        <span class="overlay-title">review workflow</span>
+        <button id="review-close" class="icon-btn" title="Close">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+          </svg>
+        </button>
+      </div>
+      <div class="overlay-body">
+        <div class="field">
+          <label for="wf-name">name</label>
+          <input id="wf-name" type="text" placeholder="my-workflow" spellcheck="false" />
+        </div>
+        <div class="field">
+          <label for="wf-description">description</label>
+          <input id="wf-description" type="text" placeholder="what this workflow does" spellcheck="false" />
+        </div>
+        <div id="wf-params" class="wf-params"></div>
+        <div class="field">
+          <label>steps</label>
+          <div id="wf-steps" class="wf-steps"></div>
+        </div>
+        <div id="wf-error" class="wf-error hidden"></div>
+        <div class="editor-actions">
+          <button id="review-discard" class="btn btn-ghost">discard</button>
+          <button id="review-save" class="btn btn-primary">save workflow</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- ── Input ── -->
   <footer id="input-area">
+    <div id="record-controls" class="record-controls">
+      <button id="record-btn" class="btn btn-record" title="Record a workflow">
+        <span class="record-dot"></span> record
+      </button>
+      <button id="stop-btn" class="btn btn-stop hidden" title="Stop recording">
+        <span class="stop-icon"></span> stop <span id="event-count" class="event-count">0</span>
+      </button>
+    </div>
     <div class="input-wrapper">
       <textarea id="message-input" placeholder="what should i do?" rows="1"></textarea>
       <button id="send-btn" title="Send" disabled>
