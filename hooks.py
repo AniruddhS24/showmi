@@ -4,10 +4,15 @@ from pathlib import Path
 
 from config import config
 from db import LOGS_DIR, WORKFLOWS_DIR
+from workflow_utils import parse_frontmatter
 
 
 def load_workflows() -> str:
-    """Read all .md files from the workflows directory and return concatenated content."""
+    """Read all .md files from the workflows directory and return concatenated content.
+
+    Parses YAML frontmatter to extract workflow name, description, and parameters.
+    Falls back gracefully for plain .md files without frontmatter.
+    """
     if not WORKFLOWS_DIR.exists():
         return ""
     workflow_files = sorted(WORKFLOWS_DIR.glob("*.md"))
@@ -18,8 +23,28 @@ def load_workflows() -> str:
         if f.name == "README.md":
             continue
         content = f.read_text().strip()
-        if content:
-            parts.append(f"## Workflow: {f.stem}\n\n{content}")
+        if not content:
+            continue
+
+        meta, body = parse_frontmatter(content)
+        name = meta.get("name", f.stem)
+        desc = meta.get("description", "")
+        params = meta.get("parameters", [])
+
+        header = f"## Workflow: {name}"
+        if desc:
+            header += f"\n{desc}"
+        if params:
+            header += "\n\nParameters:"
+            for p in params:
+                default = p.get("default", "")
+                default_note = f" (default: {default})" if default else ""
+                header += (
+                    f"\n- {{{{{p['name']}}}}}: "
+                    f"{p.get('description', '')}{default_note}"
+                )
+
+        parts.append(f"{header}\n\n{body}")
     if not parts:
         return ""
     return "# Available Workflows\n\n" + "\n\n---\n\n".join(parts)
