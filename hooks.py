@@ -3,29 +3,26 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from config import config
-
-from db import SHOWMI_DIR, LOGS_DIR
-
-WORKFLOWS_DIR = SHOWMI_DIR / "workflows"
+from db import LOGS_DIR, WORKFLOWS_DIR
 
 
-def load_skills() -> str:
-    """Read all .md files from ~/.self-learning-browseragent/workflows/ and return concatenated content."""
+def load_workflows() -> str:
+    """Read all .md files from the workflows directory and return concatenated content."""
     if not WORKFLOWS_DIR.exists():
         return ""
-    skill_files = sorted(WORKFLOWS_DIR.glob("*.md"))
-    if not skill_files:
+    workflow_files = sorted(WORKFLOWS_DIR.glob("*.md"))
+    if not workflow_files:
         return ""
     parts = []
-    for f in skill_files:
+    for f in workflow_files:
         if f.name == "README.md":
             continue
         content = f.read_text().strip()
         if content:
-            parts.append(f"## Skill: {f.stem}\n\n{content}")
+            parts.append(f"## Workflow: {f.stem}\n\n{content}")
     if not parts:
         return ""
-    return "# Available Skills\n\n" + "\n\n---\n\n".join(parts)
+    return "# Available Workflows\n\n" + "\n\n---\n\n".join(parts)
 
 
 async def on_step_start(agent) -> None:
