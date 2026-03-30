@@ -1,71 +1,376 @@
+// ── Constants ──
+const API_BASE = "http://localhost:8765";
+
 // ── DOM refs ──
 const messagesEl = document.getElementById("messages");
+const emptyStateEl = document.getElementById("empty-state");
 const inputEl = document.getElementById("message-input");
 const sendBtn = document.getElementById("send-btn");
 const statusEl = document.getElementById("status-indicator");
-const settingsBtn = document.getElementById("settings-btn");
-const settingsOverlay = document.getElementById("settings-overlay");
-const settingsClose = document.getElementById("settings-close");
-const settingsSave = document.getElementById("settings-save");
-const tempSlider = document.getElementById("setting-temperature");
+const themeBtn = document.getElementById("theme-btn");
+const newChatBtn = document.getElementById("new-chat-btn");
+
+// Chats drawer
+const chatsBtn = document.getElementById("chats-btn");
+const chatsDrawer = document.getElementById("chats-drawer");
+const chatsClose = document.getElementById("chats-close");
+const chatsList = document.getElementById("chats-list");
+
+// Model selector
+const modelBadge = document.getElementById("model-badge");
+const modelBadgeName = document.getElementById("model-badge-name");
+const modelDropdown = document.getElementById("model-dropdown");
+const modelDropdownList = document.getElementById("model-dropdown-list");
+const manageModelsBtn = document.getElementById("manage-models-btn");
+
+// Models overlay
+const modelsOverlay = document.getElementById("models-overlay");
+const modelsClose = document.getElementById("models-close");
+const modelsListFull = document.getElementById("models-list-full");
+const addModelBtn = document.getElementById("add-model-btn");
+const modelEditor = document.getElementById("model-editor");
+const editorTitle = document.getElementById("editor-title");
+const editorCancel = document.getElementById("editor-cancel");
+const editorSave = document.getElementById("editor-save");
+const tempSlider = document.getElementById("edit-temperature");
 const tempValue = document.getElementById("temp-value");
+
+// Disconnected banner
+const disconnectedBanner = document.getElementById("disconnected-banner");
+const retryConnectBtn = document.getElementById("retry-connect-btn");
 
 // ── State ──
 let ws = null;
 let reconnectDelay = 1000;
 const MAX_RECONNECT_DELAY = 30000;
+let failedConnections = 0;
 let isAgentWorking = false;
-let settings = {
-  provider: "anthropic",
-  api_key: "",
-  base_url: "",
-  model: "",
-  temperature: 0.5,
-};
+let stepTraceEl = null;
+let currentSessionId = null;
+let models = [];
+let editingModelId = null;
 
-// ── Settings ──
-function loadSettings() {
-  chrome.storage.local.get("browseragent_settings", (result) => {
-    if (result.browseragent_settings) {
-      settings = { ...settings, ...result.browseragent_settings };
-    }
-    applySettingsToUI();
+// ── Theme ──
+function initTheme() {
+  chrome.storage.local.get("showmi_theme", (result) => {
+    document.documentElement.setAttribute("data-theme", result.showmi_theme || "dark");
   });
 }
 
-function applySettingsToUI() {
-  document.getElementById("setting-provider").value = settings.provider;
-  document.getElementById("setting-api-key").value = settings.api_key;
-  document.getElementById("setting-base-url").value = settings.base_url;
-  document.getElementById("setting-model").value = settings.model;
-  document.getElementById("setting-temperature").value = settings.temperature;
-  tempValue.textContent = settings.temperature;
+function toggleTheme() {
+  const next = document.documentElement.getAttribute("data-theme") === "dark" ? "light" : "dark";
+  document.documentElement.setAttribute("data-theme", next);
+  chrome.storage.local.set({ showmi_theme: next });
 }
 
-function saveSettings() {
-  settings.provider = document.getElementById("setting-provider").value;
-  settings.api_key = document.getElementById("setting-api-key").value;
-  settings.base_url = document.getElementById("setting-base-url").value;
-  settings.model = document.getElementById("setting-model").value;
-  settings.temperature = parseFloat(document.getElementById("setting-temperature").value);
-  chrome.storage.local.set({ browseragent_settings: settings });
-  settingsOverlay.classList.add("hidden");
-}
+themeBtn.addEventListener("click", toggleTheme);
 
-settingsBtn.addEventListener("click", () => settingsOverlay.classList.remove("hidden"));
-settingsClose.addEventListener("click", () => settingsOverlay.classList.add("hidden"));
-settingsOverlay.addEventListener("click", (e) => {
-  if (e.target === settingsOverlay) settingsOverlay.classList.add("hidden");
+// ── New chat ──
+newChatBtn.addEventListener("click", () => {
+  startNewChat();
 });
-settingsSave.addEventListener("click", saveSettings);
+
+function startNewChat() {
+  // Clear messages
+  messagesEl.innerHTML = "";
+  messagesEl.appendChild(emptyStateEl);
+  emptyStateEl.style.display = "";
+  stepTraceEl = null;
+  currentSessionId = null;
+  isAgentWorking = false;
+  updateInputState();
+}
+
+// ── Chats drawer ──
+chatsBtn.addEventListener("click", () => {
+  chatsDrawer.classList.remove("hidden");
+  loadChats();
+});
+
+chatsClose.addEventListener("click", () => {
+  chatsDrawer.classList.add("hidden");
+});
+
+async function loadChats() {
+  try {
+    const res = await fetch(`${API_BASE}/api/sessions`);
+    const sessions = await res.json();
+    renderChats(sessions);
+  } catch {
+    chatsList.innerHTML = '<div class="no-chats">could not load chats</div>';
+  }
+}
+
+function renderChats(sessions) {
+  if (!sessions.length) {
+    chatsList.innerHTML = '<div class="no-chats">no chats yet</div>';
+    return;
+  }
+  chatsList.innerHTML = "";
+  sessions.forEach((s) => {
+    const el = document.createElement("div");
+    el.className = "chat-item";
+    const date = new Date(s.created_at);
+    const dateStr = date.toLocaleDateString(undefined, { month: "short", day: "numeric" }) +
+      " " + date.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+    el.innerHTML = `
+      <div class="chat-item-title">${escapeHtml(s.title || "untitled")}</div>
+      <div class="chat-item-date">${dateStr}</div>
+    `;
+    el.addEventListener("click", () => loadChat(s.id));
+    chatsList.appendChild(el);
+  });
+}
+
+async function loadChat(sessionId) {
+  chatsDrawer.classList.add("hidden");
+  try {
+    const res = await fetch(`${API_BASE}/api/sessions/${sessionId}/messages`);
+    const messages = await res.json();
+    messagesEl.innerHTML = "";
+    emptyStateEl.style.display = "none";
+    stepTraceEl = null;
+    currentSessionId = sessionId;
+
+    messages.forEach((msg) => {
+      if (msg.role === "user") {
+        addMessage("user", msg.content);
+      } else if (msg.metadata) {
+        const meta = msg.metadata;
+        if (meta.type === "step" && meta.actions) {
+          addStepMessage(meta);
+        } else if (meta.type === "result") {
+          addResultMessage(meta);
+        } else if (meta.type === "error") {
+          addMessage("error", meta.message || msg.content);
+        } else {
+          addMessage("agent", msg.content);
+        }
+      } else {
+        addMessage("agent", msg.content);
+      }
+    });
+  } catch {
+    addMessage("error", "Failed to load chat history");
+  }
+}
+
+// ── Model selector (badge dropdown) ──
+modelBadge.addEventListener("click", (e) => {
+  e.stopPropagation();
+  modelDropdown.classList.toggle("hidden");
+  if (!modelDropdown.classList.contains("hidden")) {
+    refreshModelDropdown();
+  }
+});
+
+// Close dropdown on outside click
+document.addEventListener("click", (e) => {
+  if (!e.target.closest(".model-selector")) {
+    modelDropdown.classList.add("hidden");
+  }
+});
+
+manageModelsBtn.addEventListener("click", () => {
+  modelDropdown.classList.add("hidden");
+  openModelsOverlay();
+});
+
+function refreshModelDropdown() {
+  fetchModels().then(() => {
+    modelDropdownList.innerHTML = "";
+    if (!models.length) {
+      modelDropdownList.innerHTML = '<div class="model-dropdown-item" style="color:var(--text-dim);cursor:default">no models</div>';
+      return;
+    }
+    models.forEach((m) => {
+      const item = document.createElement("div");
+      item.className = "model-dropdown-item" + (m.is_active ? " active" : "");
+      item.innerHTML = `
+        <span>${escapeHtml(m.name || m.model || "untitled")}</span>
+        ${m.is_active ? '<span class="check">&#10003;</span>' : ""}
+      `;
+      item.addEventListener("click", () => activateModel(m.id));
+      modelDropdownList.appendChild(item);
+    });
+  });
+}
+
+async function activateModel(id) {
+  try {
+    await fetch(`${API_BASE}/api/models/${id}/activate`, { method: "PUT" });
+    await fetchModels();
+    modelDropdown.classList.add("hidden");
+  } catch {}
+}
+
+async function fetchModels() {
+  try {
+    const res = await fetch(`${API_BASE}/api/models`);
+    models = await res.json();
+    updateModelBadge();
+  } catch {
+    models = [];
+    updateModelBadge();
+  }
+}
+
+function updateModelBadge() {
+  const active = models.find((m) => m.is_active);
+  modelBadgeName.textContent = active ? (active.name || active.model || "untitled") : "no model";
+}
+
+// ── Models overlay ──
+function openModelsOverlay() {
+  modelsOverlay.classList.remove("hidden");
+  hideEditor();
+  fetchModels().then(renderModelsListFull);
+}
+
+modelsClose.addEventListener("click", () => {
+  modelsOverlay.classList.add("hidden");
+});
+
+modelsOverlay.addEventListener("click", (e) => {
+  if (e.target === modelsOverlay) modelsOverlay.classList.add("hidden");
+});
+
+function renderModelsListFull() {
+  if (!models.length) {
+    modelsListFull.innerHTML = '<div class="no-models">no models configured</div>';
+    return;
+  }
+  modelsListFull.innerHTML = "";
+  models.forEach((m) => {
+    const card = document.createElement("div");
+    card.className = "model-card" + (m.is_active ? " selected" : "");
+    card.innerHTML = `
+      <div class="model-card-info">
+        <div class="model-card-name">${escapeHtml(m.name || m.model || "untitled")}</div>
+        <div class="model-card-detail">${escapeHtml(m.provider)} &middot; ${escapeHtml(m.model || "—")} &middot; ${m.api_key_preview || ""}</div>
+      </div>
+      <div class="model-card-actions">
+        ${m.is_active ? '<span class="selected-badge">active</span>' : ""}
+        <button class="icon-btn edit-btn" title="Edit">
+          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
+            <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+          </svg>
+        </button>
+        <button class="icon-btn delete-btn" title="Delete">
+          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+          </svg>
+        </button>
+      </div>
+    `;
+
+    // Click card to activate
+    card.addEventListener("click", (e) => {
+      if (e.target.closest(".edit-btn") || e.target.closest(".delete-btn")) return;
+      activateModel(m.id).then(() => {
+        fetchModels().then(renderModelsListFull);
+      });
+    });
+
+    card.querySelector(".edit-btn").addEventListener("click", () => openEditor(m));
+    card.querySelector(".delete-btn").addEventListener("click", () => deleteModel(m.id));
+
+    modelsListFull.appendChild(card);
+  });
+}
+
+async function deleteModel(id) {
+  try {
+    await fetch(`${API_BASE}/api/models/${id}`, { method: "DELETE" });
+    await fetchModels();
+    renderModelsListFull();
+  } catch {}
+}
+
+// ── Model editor ──
+addModelBtn.addEventListener("click", () => openEditor(null));
+
+function openEditor(m) {
+  editingModelId = m ? m.id : null;
+  editorTitle.textContent = m ? "edit model" : "new model";
+  document.getElementById("edit-name").value = m ? m.name : "";
+  document.getElementById("edit-provider").value = m ? m.provider : "anthropic";
+  document.getElementById("edit-api-key").value = "";
+  document.getElementById("edit-api-key").type = "password";
+  document.getElementById("edit-api-key").placeholder = m ? (m.api_key_preview || "sk-...") : "sk-...";
+  document.getElementById("edit-base-url").value = m ? m.base_url : "";
+  document.getElementById("edit-model").value = m ? m.model : "";
+  document.getElementById("edit-temperature").value = m ? m.temperature : 0.5;
+  tempValue.textContent = m ? m.temperature : 0.5;
+  modelEditor.classList.remove("hidden");
+}
+
+function hideEditor() {
+  modelEditor.classList.add("hidden");
+  editingModelId = null;
+}
+
+async function saveEditorData() {
+  const data = {
+    name: document.getElementById("edit-name").value.trim(),
+    provider: document.getElementById("edit-provider").value,
+    api_key: document.getElementById("edit-api-key").value,
+    base_url: document.getElementById("edit-base-url").value.trim(),
+    model: document.getElementById("edit-model").value.trim(),
+    temperature: parseFloat(document.getElementById("edit-temperature").value),
+  };
+
+  if (!data.name) data.name = data.model || data.provider;
+
+  try {
+    if (editingModelId) {
+      await fetch(`${API_BASE}/api/models/${editingModelId}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(data),
+      });
+    } else {
+      await fetch(`${API_BASE}/api/models`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(data),
+      });
+    }
+    await fetchModels();
+    renderModelsListFull();
+    hideEditor();
+  } catch {}
+}
+
+editorCancel.addEventListener("click", hideEditor);
+editorSave.addEventListener("click", saveEditorData);
 tempSlider.addEventListener("input", () => {
   tempValue.textContent = tempSlider.value;
+});
+
+// Toggle password visibility
+document.querySelector(".toggle-visibility").addEventListener("click", () => {
+  const input = document.getElementById("edit-api-key");
+  input.type = input.type === "password" ? "text" : "password";
 });
 
 // ── WebSocket ──
 function setStatus(state) {
   statusEl.className = "status " + state;
   statusEl.title = state.charAt(0).toUpperCase() + state.slice(1);
+}
+
+function showDisconnectedBanner() {
+  disconnectedBanner.classList.remove("hidden");
+  messagesEl.style.display = "none";
+  document.getElementById("input-area").style.display = "none";
+}
+
+function hideDisconnectedBanner() {
+  disconnectedBanner.classList.add("hidden");
+  messagesEl.style.display = "";
+  document.getElementById("input-area").style.display = "";
 }
 
 function connect() {
@@ -77,25 +382,28 @@ function connect() {
   ws.addEventListener("open", () => {
     setStatus("connected");
     reconnectDelay = 1000;
+    failedConnections = 0;
+    hideDisconnectedBanner();
+    updateSendState();
   });
 
   ws.addEventListener("close", () => {
     setStatus("disconnected");
     ws = null;
+    failedConnections++;
+    updateSendState();
+    if (failedConnections >= 2) {
+      showDisconnectedBanner();
+    }
     scheduleReconnect();
   });
 
-  ws.addEventListener("error", () => {
-    // close event will fire after this
-  });
+  ws.addEventListener("error", () => {});
 
   ws.addEventListener("message", (event) => {
     try {
-      const data = JSON.parse(event.data);
-      handleServerMessage(data);
-    } catch {
-      // ignore malformed messages
-    }
+      handleServerMessage(JSON.parse(event.data));
+    } catch {}
   });
 }
 
@@ -106,23 +414,49 @@ function scheduleReconnect() {
   }, reconnectDelay);
 }
 
+// ── Retry + copy commands ──
+retryConnectBtn.addEventListener("click", () => {
+  failedConnections = 0;
+  reconnectDelay = 1000;
+  hideDisconnectedBanner();
+  if (ws) { try { ws.close(); } catch {} }
+  ws = null;
+  connect();
+});
+
+document.querySelectorAll(".disconnected-cmd").forEach((el) => {
+  el.addEventListener("click", () => {
+    const wrap = el.closest(".disconnected-cmd-wrap");
+    navigator.clipboard.writeText(el.textContent.trim()).then(() => {
+      wrap.classList.add("copied");
+      setTimeout(() => wrap.classList.remove("copied"), 1500);
+    });
+  });
+});
+
 // ── Message handling ──
 function handleServerMessage(data) {
-  removeThinking();
-
   switch (data.type) {
+    case "session":
+      currentSessionId = data.session_id;
+      break;
     case "step":
+      removeThinking();
       addStepMessage(data);
       showThinking();
       break;
     case "result":
+      removeThinking();
       addResultMessage(data);
       isAgentWorking = false;
+      stepTraceEl = null;
       updateInputState();
       break;
     case "error":
+      removeThinking();
       addMessage("error", data.message || "Unknown error");
       isAgentWorking = false;
+      stepTraceEl = null;
       updateInputState();
       break;
     default:
@@ -144,27 +478,26 @@ async function sendMessage() {
   const text = inputEl.value.trim();
   if (!text || !ws || ws.readyState !== WebSocket.OPEN) return;
 
+  // Hide empty state
+  if (emptyStateEl) emptyStateEl.style.display = "none";
+
   addMessage("user", text);
   inputEl.value = "";
   autoResizeInput();
 
   const activeTab = await getActiveTab();
 
+  // Server will use the active model from DB — no need to send settings
   const payload = {
     type: "task",
     content: text,
-    settings: {
-      provider: settings.provider,
-      model: settings.model,
-      base_url: settings.base_url,
-      api_key: settings.api_key,
-      temperature: settings.temperature,
-    },
+    settings: {},
     active_tab: activeTab,
   };
 
   ws.send(JSON.stringify(payload));
   isAgentWorking = true;
+  stepTraceEl = null;
   updateInputState();
   showThinking();
 }
@@ -178,44 +511,74 @@ function addMessage(role, text) {
   scrollToBottom();
 }
 
-function addStepMessage(data) {
-  const el = document.createElement("div");
-  el.className = "message agent";
+function ensureStepTrace() {
+  if (!stepTraceEl) {
+    stepTraceEl = document.createElement("div");
+    stepTraceEl.className = "step-trace";
+    messagesEl.appendChild(stepTraceEl);
+  }
+  return stepTraceEl;
+}
 
-  let html = '<div class="step-header">';
-  html += `<span class="step-number">${data.step_number || "?"}</span>`;
-  html += "<span>Step</span>";
-  html += "</div>";
+function addStepMessage(data) {
+  const trace = ensureStepTrace();
+
+  // Mark previous active steps as completed
+  trace.querySelectorAll(".step-item.active").forEach((el) => {
+    el.classList.remove("active");
+    el.classList.add("completed");
+    const loading = el.querySelector(".step-loading");
+    if (loading) loading.remove();
+  });
+
+  const item = document.createElement("div");
+  item.className = "step-item active";
+
+  let html = '<div class="step-dot"></div>';
+  html += `<span class="step-number">step ${data.step_number || "?"}</span>`;
 
   if (data.goal) {
     html += `<div class="step-goal">${escapeHtml(data.goal)}</div>`;
   }
   if (data.actions) {
-    const actions = Array.isArray(data.actions) ? data.actions.join(", ") : data.actions;
+    const actions = Array.isArray(data.actions) ? data.actions.map((a) => {
+      if (typeof a === "object" && a.action) return JSON.stringify(a.action);
+      return String(a);
+    }).join(", ") : data.actions;
     html += `<div class="step-actions">${escapeHtml(actions)}</div>`;
   }
-  if (data.url) {
+  if (data.url && data.url !== "unknown") {
     html += `<div class="step-url">${escapeHtml(data.url)}</div>`;
   }
 
-  el.innerHTML = html;
-  messagesEl.appendChild(el);
+  html += '<div class="step-loading"><div class="step-loading-bar"></div><span>processing</span></div>';
+
+  item.innerHTML = html;
+  trace.appendChild(item);
   scrollToBottom();
 }
 
 function addResultMessage(data) {
-  const el = document.createElement("div");
-  el.className = "message agent";
+  if (stepTraceEl) {
+    stepTraceEl.querySelectorAll(".step-item.active").forEach((el) => {
+      el.classList.remove("active");
+      el.classList.add("completed");
+      const loading = el.querySelector(".step-loading");
+      if (loading) loading.remove();
+    });
+  }
 
-  let html = '<div class="result-summary">';
-  html += renderMarkdown(data.summary || "Task completed.");
-  html += "</div>";
+  const el = document.createElement("div");
+  el.className = "result-block";
+
+  let html = '<div class="result-label">result</div>';
+  html += `<div class="result-text">${renderMarkdown(data.summary || "Task completed.")}</div>`;
 
   const meta = [];
   if (data.steps_taken != null) meta.push(`${data.steps_taken} steps`);
   if (data.errors && data.errors.length) meta.push(`${data.errors.length} error(s)`);
   if (meta.length) {
-    html += `<div class="result-meta">${meta.join(" \u00b7 ")}</div>`;
+    html += `<div class="result-meta">${meta.join(" &middot; ")}</div>`;
   }
 
   el.innerHTML = html;
@@ -224,16 +587,16 @@ function addResultMessage(data) {
 }
 
 function showThinking() {
-  if (document.querySelector(".thinking")) return;
+  if (document.querySelector(".thinking-indicator")) return;
   const el = document.createElement("div");
-  el.className = "thinking";
-  el.innerHTML = "<span></span><span></span><span></span>";
+  el.className = "thinking-indicator";
+  el.innerHTML = '<div class="step-dot"></div><div class="thinking-dots"><span></span><span></span><span></span></div>';
   messagesEl.appendChild(el);
   scrollToBottom();
 }
 
 function removeThinking() {
-  const el = document.querySelector(".thinking");
+  const el = document.querySelector(".thinking-indicator");
   if (el) el.remove();
 }
 
@@ -244,31 +607,29 @@ function scrollToBottom() {
 }
 
 function updateInputState() {
-  sendBtn.disabled = isAgentWorking;
   inputEl.disabled = isAgentWorking;
-  inputEl.placeholder = isAgentWorking ? "Agent is working..." : "Describe what you want to do...";
+  inputEl.placeholder = isAgentWorking ? "agent is working..." : "what should i do?";
+  updateSendState();
+  if (!isAgentWorking) inputEl.focus();
 }
 
-// ── Markdown-lite renderer ──
+function updateSendState() {
+  const hasText = inputEl.value.trim().length > 0;
+  const connected = ws && ws.readyState === WebSocket.OPEN;
+  sendBtn.disabled = isAgentWorking || !hasText || !connected;
+}
+
+// ── Markdown-lite ──
 function escapeHtml(str) {
-  return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  return String(str).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
 function renderMarkdown(text) {
   let html = escapeHtml(text);
-
-  // Code blocks (``` ... ```)
   html = html.replace(/```([\s\S]*?)```/g, (_m, code) => `<pre>${code.trim()}</pre>`);
-
-  // Inline code
   html = html.replace(/`([^`]+)`/g, (_m, code) => `<code>${code}</code>`);
-
-  // Bold
   html = html.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
-
-  // Line breaks
   html = html.replace(/\n/g, "<br>");
-
   return html;
 }
 
@@ -280,15 +641,19 @@ inputEl.addEventListener("keydown", (e) => {
   }
 });
 
-inputEl.addEventListener("input", autoResizeInput);
+inputEl.addEventListener("input", () => {
+  autoResizeInput();
+  updateSendState();
+});
 
 function autoResizeInput() {
   inputEl.style.height = "auto";
-  inputEl.style.height = Math.min(inputEl.scrollHeight, 120) + "px";
+  inputEl.style.height = Math.min(inputEl.scrollHeight, 100) + "px";
 }
 
 sendBtn.addEventListener("click", sendMessage);
 
 // ── Init ──
-loadSettings();
+initTheme();
+fetchModels();
 connect();
