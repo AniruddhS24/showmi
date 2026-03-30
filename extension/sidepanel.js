@@ -39,21 +39,36 @@ const tempValue = document.getElementById("temp-value");
 const disconnectedBanner = document.getElementById("disconnected-banner");
 const retryConnectBtn = document.getElementById("retry-connect-btn");
 
+// Tab context badge
+const tabContextBadge = document.getElementById("tab-context-badge");
+const tabContextUrl = document.getElementById("tab-context-url");
+const tabContextRemove = document.getElementById("tab-context-remove");
+
 // ── State ──
 let ws = null;
 let reconnectDelay = 1000;
 const MAX_RECONNECT_DELAY = 30000;
 let failedConnections = 0;
-let isAgentWorking = false;
-let stepTraceEl = null;
 let currentSessionId = null;
 let models = [];
 let editingModelId = null;
+let attachedTab = null; // { url, title } or null if user dismissed
+
+// Per-session state for concurrent chats
+// { sessionId: { messages: [...elements], stepTraceEl, isWorking } }
+let sessionStates = {};
+
+function getSessionState(sessionId) {
+  if (!sessionStates[sessionId]) {
+    sessionStates[sessionId] = { stepTraceEl: null, isWorking: false };
+  }
+  return sessionStates[sessionId];
+}
 
 // ── Theme ──
 function initTheme() {
   chrome.storage.local.get("showmi_theme", (result) => {
-    document.documentElement.setAttribute("data-theme", result.showmi_theme || "dark");
+    document.documentElement.setAttribute("data-theme", result.showmi_theme || "light");
   });
 }
 
@@ -75,10 +90,9 @@ function startNewChat() {
   messagesEl.innerHTML = "";
   messagesEl.appendChild(emptyStateEl);
   emptyStateEl.style.display = "";
-  stepTraceEl = null;
   currentSessionId = null;
-  isAgentWorking = false;
   updateInputState();
+  refreshTabContext();
 }
 
 // ── Chats drawer ──
@@ -101,6 +115,18 @@ async function loadChats() {
   }
 }
 
+async function deleteChat(sessionId) {
+  try {
+    await fetch(`${API_BASE}/api/sessions/${sessionId}`, { method: "DELETE" });
+    // If we deleted the active chat, reset to new chat
+    if (sessionId === currentSessionId) {
+      startNewChat();
+    }
+    delete sessionStates[sessionId];
+    loadChats();
+  } catch {}
+}
+
 function renderChats(sessions) {
   if (!sessions.length) {
     chatsList.innerHTML = '<div class="no-chats">no chats yet</div>';
@@ -109,14 +135,38 @@ function renderChats(sessions) {
   chatsList.innerHTML = "";
   sessions.forEach((s) => {
     const el = document.createElement("div");
-    el.className = "chat-item";
+    el.className = "chat-item" + (s.id === currentSessionId ? " active" : "");
     const date = new Date(s.created_at);
     const dateStr = date.toLocaleDateString(undefined, { month: "short", day: "numeric" }) +
       " " + date.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+
+    // Status indicator
+    const status = s.status || "idle";
+    let statusDot = "";
+    if (status === "running") {
+      statusDot = '<span class="chat-status running" title="Running"></span>';
+    } else if (status === "error") {
+      statusDot = '<span class="chat-status error" title="Error"></span>';
+    } else if (status === "completed") {
+      statusDot = '<span class="chat-status completed" title="Completed"></span>';
+    }
+
     el.innerHTML = `
-      <div class="chat-item-title">${escapeHtml(s.title || "untitled")}</div>
+      <div class="chat-item-row">
+        ${statusDot}
+        <div class="chat-item-title">${escapeHtml(s.title || "untitled")}</div>
+        <button class="chat-item-delete icon-btn" title="Delete">
+          <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+          </svg>
+        </button>
+      </div>
       <div class="chat-item-date">${dateStr}</div>
     `;
+    el.querySelector(".chat-item-delete").addEventListener("click", (e) => {
+      e.stopPropagation();
+      deleteChat(s.id);
+    });
     el.addEventListener("click", () => loadChat(s.id));
     chatsList.appendChild(el);
   });
@@ -129,8 +179,11 @@ async function loadChat(sessionId) {
     const messages = await res.json();
     messagesEl.innerHTML = "";
     emptyStateEl.style.display = "none";
-    stepTraceEl = null;
     currentSessionId = sessionId;
+
+    // Check if this session has an active agent
+    const state = getSessionState(sessionId);
+    let stepTraceEl = null;
 
     messages.forEach((msg) => {
       if (msg.role === "user") {
@@ -138,11 +191,13 @@ async function loadChat(sessionId) {
       } else if (msg.metadata) {
         const meta = msg.metadata;
         if (meta.type === "step" && meta.actions) {
-          addStepMessage(meta);
+          stepTraceEl = addStepMessage(meta, stepTraceEl);
         } else if (meta.type === "result") {
           addResultMessage(meta);
+          stepTraceEl = null;
         } else if (meta.type === "error") {
           addMessage("error", meta.message || msg.content);
+          stepTraceEl = null;
         } else {
           addMessage("agent", msg.content);
         }
@@ -150,6 +205,13 @@ async function loadChat(sessionId) {
         addMessage("agent", msg.content);
       }
     });
+
+    // If session is still running, show thinking indicator
+    if (state.isWorking) {
+      showThinking();
+    }
+
+    updateInputState();
   } catch {
     addMessage("error", "Failed to load chat history");
   }
@@ -436,43 +498,110 @@ document.querySelectorAll(".disconnected-cmd").forEach((el) => {
 
 // ── Message handling ──
 function handleServerMessage(data) {
+  const msgSessionId = data.session_id;
+
   switch (data.type) {
     case "session":
-      currentSessionId = data.session_id;
+      // Always track the session — for new chats this sets the ID,
+      // for continued chats it confirms the existing one
+      if (data.session_id) {
+        currentSessionId = data.session_id;
+        const state = getSessionState(data.session_id);
+        state.isWorking = true;
+      }
       break;
-    case "step":
-      removeThinking();
-      addStepMessage(data);
-      showThinking();
+
+    case "step": {
+      const state = getSessionState(msgSessionId);
+      // Only render if this is the active chat
+      if (msgSessionId === currentSessionId) {
+        removeThinking();
+        const trace = addStepMessage(data, state.stepTraceEl);
+        state.stepTraceEl = trace;
+        showThinking();
+      }
       break;
-    case "result":
-      removeThinking();
-      addResultMessage(data);
-      isAgentWorking = false;
-      stepTraceEl = null;
-      updateInputState();
+    }
+
+    case "result": {
+      const state = getSessionState(msgSessionId);
+      state.isWorking = false;
+      state.stepTraceEl = null;
+      if (msgSessionId === currentSessionId) {
+        removeThinking();
+        addResultMessage(data);
+        updateInputState();
+      }
       break;
-    case "error":
-      removeThinking();
-      addMessage("error", data.message || "Unknown error");
-      isAgentWorking = false;
-      stepTraceEl = null;
-      updateInputState();
+    }
+
+    case "error": {
+      const state = getSessionState(msgSessionId);
+      state.isWorking = false;
+      state.stepTraceEl = null;
+      if (msgSessionId === currentSessionId) {
+        removeThinking();
+        addMessage("error", data.message || "Unknown error");
+        updateInputState();
+      }
       break;
+    }
+
     default:
       if (data.content) addMessage("agent", data.content);
   }
 }
 
-async function getActiveTab() {
+// ── Tab context ──
+async function refreshTabContext() {
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (tab && tab.url && !tab.url.startsWith("chrome://")) {
-      return { url: tab.url, title: tab.title || "" };
+    if (tab && tab.url && !tab.url.startsWith("chrome://") && !tab.url.startsWith("chrome-extension://")) {
+      attachedTab = { url: tab.url, title: tab.title || "" };
+      showTabBadge();
+    } else {
+      attachedTab = null;
+      hideTabBadge();
     }
-  } catch {}
-  return null;
+  } catch {
+    attachedTab = null;
+    hideTabBadge();
+  }
 }
+
+function showTabBadge() {
+  if (!attachedTab) return;
+  try {
+    const url = new URL(attachedTab.url);
+    tabContextUrl.textContent = url.hostname + (url.pathname !== "/" ? url.pathname : "");
+  } catch {
+    tabContextUrl.textContent = attachedTab.url;
+  }
+  tabContextBadge.classList.remove("hidden");
+}
+
+function hideTabBadge() {
+  tabContextBadge.classList.add("hidden");
+}
+
+tabContextRemove.addEventListener("click", () => {
+  attachedTab = null;
+  hideTabBadge();
+});
+
+// Re-detect tab when user switches tabs
+chrome.tabs.onActivated.addListener(() => {
+  // Only auto-refresh if user hasn't explicitly dismissed
+  if (attachedTab !== null || !tabContextBadge.classList.contains("hidden")) {
+    refreshTabContext();
+  }
+});
+
+chrome.tabs.onUpdated.addListener((_tabId, changeInfo) => {
+  if (changeInfo.url && attachedTab !== null) {
+    refreshTabContext();
+  }
+});
 
 async function sendMessage() {
   const text = inputEl.value.trim();
@@ -485,19 +614,27 @@ async function sendMessage() {
   inputEl.value = "";
   autoResizeInput();
 
-  const activeTab = await getActiveTab();
-
-  // Server will use the active model from DB — no need to send settings
   const payload = {
     type: "task",
     content: text,
     settings: {},
-    active_tab: activeTab,
+    active_tab: attachedTab, // only included if badge is visible
   };
 
+  // If we have an existing session, send session_id for multi-turn
+  if (currentSessionId) {
+    payload.session_id = currentSessionId;
+  }
+
   ws.send(JSON.stringify(payload));
-  isAgentWorking = true;
-  stepTraceEl = null;
+
+  // Mark current session as working
+  if (currentSessionId) {
+    const state = getSessionState(currentSessionId);
+    state.isWorking = true;
+    state.stepTraceEl = null;
+  }
+
   updateInputState();
   showThinking();
 }
@@ -511,17 +648,18 @@ function addMessage(role, text) {
   scrollToBottom();
 }
 
-function ensureStepTrace() {
-  if (!stepTraceEl) {
-    stepTraceEl = document.createElement("div");
-    stepTraceEl.className = "step-trace";
-    messagesEl.appendChild(stepTraceEl);
+function ensureStepTrace(existingTrace) {
+  if (existingTrace && existingTrace.parentNode) {
+    return existingTrace;
   }
-  return stepTraceEl;
+  const trace = document.createElement("div");
+  trace.className = "step-trace";
+  messagesEl.appendChild(trace);
+  return trace;
 }
 
-function addStepMessage(data) {
-  const trace = ensureStepTrace();
+function addStepMessage(data, existingTrace) {
+  const trace = ensureStepTrace(existingTrace);
 
   // Mark previous active steps as completed
   trace.querySelectorAll(".step-item.active").forEach((el) => {
@@ -532,7 +670,8 @@ function addStepMessage(data) {
   });
 
   const item = document.createElement("div");
-  item.className = "step-item active";
+  const hasErrors = data.actions && Array.isArray(data.actions) && data.actions.some((a) => a && a.error);
+  item.className = "step-item active" + (hasErrors ? " has-error" : "");
 
   let html = '<div class="step-dot"></div>';
   html += `<span class="step-number">step ${data.step_number || "?"}</span>`;
@@ -540,13 +679,43 @@ function addStepMessage(data) {
   if (data.goal) {
     html += `<div class="step-goal">${escapeHtml(data.goal)}</div>`;
   }
-  if (data.actions) {
-    const actions = Array.isArray(data.actions) ? data.actions.map((a) => {
-      if (typeof a === "object" && a.action) return JSON.stringify(a.action);
-      return String(a);
-    }).join(", ") : data.actions;
-    html += `<div class="step-actions">${escapeHtml(actions)}</div>`;
+
+  if (data.actions && Array.isArray(data.actions)) {
+    data.actions.forEach((a) => {
+      if (!a || typeof a !== "object") return;
+
+      // Format the action name
+      let actionText = "";
+      if (a.action && typeof a.action === "object") {
+        const keys = Object.keys(a.action);
+        if (keys.length > 0) {
+          actionText = keys[0]; // e.g. "go_to_url", "click_element"
+          const params = a.action[keys[0]];
+          if (params && typeof params === "object") {
+            const paramStr = Object.entries(params)
+              .map(([k, v]) => `${k}: ${typeof v === "string" ? v : JSON.stringify(v)}`)
+              .join(", ");
+            if (paramStr) actionText += ` (${paramStr})`;
+          } else if (params) {
+            actionText += ` (${params})`;
+          }
+        }
+      } else if (a.action) {
+        actionText = String(a.action);
+      }
+
+      if (a.error) {
+        html += `<div class="step-error"><span class="step-error-icon">!</span> ${escapeHtml(String(a.error))}</div>`;
+      } else if (actionText) {
+        html += `<div class="step-actions">${escapeHtml(actionText)}</div>`;
+      }
+
+      if (a.extracted) {
+        html += `<div class="step-extracted">${escapeHtml(String(a.extracted).substring(0, 200))}</div>`;
+      }
+    });
   }
+
   if (data.url && data.url !== "unknown") {
     html += `<div class="step-url">${escapeHtml(data.url)}</div>`;
   }
@@ -556,17 +725,19 @@ function addStepMessage(data) {
   item.innerHTML = html;
   trace.appendChild(item);
   scrollToBottom();
+
+  return trace;
 }
 
 function addResultMessage(data) {
-  if (stepTraceEl) {
-    stepTraceEl.querySelectorAll(".step-item.active").forEach((el) => {
-      el.classList.remove("active");
-      el.classList.add("completed");
-      const loading = el.querySelector(".step-loading");
-      if (loading) loading.remove();
-    });
-  }
+  // Complete any active step traces in the DOM
+  const activeSteps = messagesEl.querySelectorAll(".step-item.active");
+  activeSteps.forEach((el) => {
+    el.classList.remove("active");
+    el.classList.add("completed");
+    const loading = el.querySelector(".step-loading");
+    if (loading) loading.remove();
+  });
 
   const el = document.createElement("div");
   el.className = "result-block";
@@ -574,12 +745,21 @@ function addResultMessage(data) {
   let html = '<div class="result-label">result</div>';
   html += `<div class="result-text">${renderMarkdown(data.summary || "Task completed.")}</div>`;
 
+  // Filter out None/null/empty errors
+  const realErrors = (data.errors || []).filter((e) => {
+    if (!e) return false;
+    const s = String(e).trim().toLowerCase();
+    return s !== "" && s !== "none" && s !== "null";
+  });
+
   const meta = [];
   if (data.steps_taken != null) meta.push(`${data.steps_taken} steps`);
-  if (data.errors && data.errors.length) meta.push(`${data.errors.length} error(s)`);
+  if (realErrors.length) meta.push(`${realErrors.length} error(s)`);
   if (meta.length) {
     html += `<div class="result-meta">${meta.join(" &middot; ")}</div>`;
   }
+
+  // Errors are already shown inline on each step — no need to repeat here
 
   el.innerHTML = html;
   messagesEl.appendChild(el);
@@ -607,16 +787,19 @@ function scrollToBottom() {
 }
 
 function updateInputState() {
-  inputEl.disabled = isAgentWorking;
-  inputEl.placeholder = isAgentWorking ? "agent is working..." : "what should i do?";
+  // Check if current session is working
+  const isWorking = currentSessionId ? getSessionState(currentSessionId).isWorking : false;
+  inputEl.disabled = isWorking;
+  inputEl.placeholder = isWorking ? "agent is working..." : "what should i do?";
   updateSendState();
-  if (!isAgentWorking) inputEl.focus();
+  if (!isWorking) inputEl.focus();
 }
 
 function updateSendState() {
   const hasText = inputEl.value.trim().length > 0;
   const connected = ws && ws.readyState === WebSocket.OPEN;
-  sendBtn.disabled = isAgentWorking || !hasText || !connected;
+  const isWorking = currentSessionId ? getSessionState(currentSessionId).isWorking : false;
+  sendBtn.disabled = isWorking || !hasText || !connected;
 }
 
 // ── Markdown-lite ──
@@ -652,6 +835,14 @@ function autoResizeInput() {
 }
 
 sendBtn.addEventListener("click", sendMessage);
+
+// ── Periodic drawer refresh ──
+// Refresh chat list status every 3 seconds if drawer is open
+setInterval(() => {
+  if (!chatsDrawer.classList.contains("hidden")) {
+    loadChats();
+  }
+}, 3000);
 
 // ── Recording ──
 
@@ -847,3 +1038,4 @@ reviewSave.addEventListener("click", async () => {
 initTheme();
 fetchModels();
 connect();
+refreshTabContext();

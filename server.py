@@ -28,7 +28,10 @@ from db import (
     save_model,
     set_active_model,
     delete_model,
+    delete_session,
     save_context_summary,
+    update_session_status,
+    update_session_title,
 )
 from hooks import load_workflows
 from workflow_utils import (
@@ -72,6 +75,12 @@ async def api_list_sessions():
 @app.get("/api/sessions/{session_id}/messages")
 async def api_session_messages(session_id: str):
     return get_session_messages(session_id)
+
+
+@app.delete("/api/sessions/{session_id}")
+async def api_delete_session(session_id: str):
+    delete_session(session_id)
+    return {"ok": True}
 
 
 # ── REST: Models ──
@@ -346,6 +355,7 @@ def _make_step_hook(ws: WebSocket, session_id: str):
 
         msg = {
             "type": "step",
+            "session_id": session_id,
             "step_number": step,
             "goal": goal,
             "phase": "start",
@@ -405,6 +415,7 @@ def _make_step_hook(ws: WebSocket, session_id: str):
 
         msg = {
             "type": "step",
+            "session_id": session_id,
             "step_number": step,
             "goal": goal,
             "actions": actions,
@@ -491,6 +502,8 @@ async def run_agent_ws(task: str, ws: WebSocket, session_id: str, settings: dict
     )
 
     print("Running agent...\n")
+    update_session_status(session_id, "running")
+
     history = await agent.run(
         max_steps=cfg.max_steps,
         on_step_start=on_step_start,
@@ -500,12 +513,17 @@ async def run_agent_ws(task: str, ws: WebSocket, session_id: str, settings: dict
     # Final context compression at session end
     compress_chat_context(session_id, len(history.history))
 
+    # Collect error strings, filtering out None/empty
+    raw_errors = history.errors() or []
+    error_strings = [str(e) for e in raw_errors if e is not None and str(e).strip().lower() not in ("", "none")]
+
     # Build and send final result
     result_msg = {
         "type": "result",
+        "session_id": session_id,
         "summary": history.final_result() or "",
         "steps_taken": len(history.history),
-        "errors": history.errors() or [],
+        "errors": error_strings,
     }
     await ws.send_json(result_msg)
 
@@ -516,14 +534,53 @@ async def run_agent_ws(task: str, ws: WebSocket, session_id: str, settings: dict
         metadata=result_msg,
     )
 
+    # Mark completed — the agent finished successfully even if some steps had errors
+    update_session_status(session_id, "completed")
+
     print(f"\n{'='*60}")
     print("Agent finished")
     print(f"{'='*60}")
     print(f"Steps taken: {len(history.history)}")
     if history.final_result():
         print(f"Result: {history.final_result()}")
-    if history.errors():
-        print(f"Errors: {history.errors()}")
+    if error_strings:
+        print(f"Errors: {error_strings}")
+
+
+# ── Track running tasks per WebSocket ──
+_running_tasks: dict[str, asyncio.Task] = {}
+
+
+def _build_conversation_context(session_id: str) -> str:
+    """Build a conversation history summary for multi-turn context."""
+    messages = get_session_messages(session_id)
+    if not messages:
+        return ""
+    parts = []
+    for msg in messages:
+        if msg["role"] == "user":
+            parts.append(f"User: {msg['content']}")
+        elif msg["metadata"] and msg["metadata"].get("type") == "result":
+            parts.append(f"Agent result: {msg['metadata'].get('summary', '')}")
+    return "\n".join(parts)
+
+
+def _generate_title(content: str) -> str:
+    """Generate a concise title from the user's message."""
+    # Simple heuristic: take first sentence, truncate to 60 chars
+    text = content.strip().split("\n")[0]
+    # Remove common prefixes
+    for prefix in ["can you ", "could you ", "please ", "i want to ", "i need to "]:
+        if text.lower().startswith(prefix):
+            text = text[len(prefix):]
+            break
+    # Capitalize first letter
+    if text:
+        text = text[0].upper() + text[1:]
+    # Truncate
+    if len(text) > 60:
+        text = text[:57] + "..."
+    return text or "New chat"
 
 
 @app.websocket("/ws")
@@ -545,6 +602,7 @@ async def websocket_endpoint(ws: WebSocket):
             content = data.get("content", "")
             settings = data.get("settings", {})
             active_tab = data.get("active_tab")
+            client_session_id = data.get("session_id")
 
             if not content:
                 await ws.send_json({"type": "error", "message": "Empty task content"})
@@ -562,27 +620,57 @@ async def websocket_endpoint(ws: WebSocket):
                         "temperature": active["temperature"],
                     }
 
-            task = content
-            if active_tab and active_tab.get("url"):
-                task = f"[User is currently on: {active_tab['url']} — \"{active_tab.get('title', '')}\"]\n\n{content}"
+            # Reuse existing session or create new one
+            if client_session_id:
+                session_id = client_session_id
+                # Build conversation context for multi-turn
+                conversation_history = _build_conversation_context(session_id)
+            else:
+                title = _generate_title(content)
+                session_id = create_session(title=title)
+                conversation_history = ""
 
-            session_id = create_session(title=content[:120])
             add_message(session_id, "user", content)
 
-            # Send session_id back so frontend can track it
-            await ws.send_json({"type": "session", "session_id": session_id})
+            task = content
+            if conversation_history:
+                task = f"[Previous conversation in this session]\n{conversation_history}\n\n[New user request]\n{content}"
+            if active_tab and active_tab.get("url"):
+                task = f"[User is currently on: {active_tab['url']} — \"{active_tab.get('title', '')}\"]\n\n{task}"
 
-            try:
-                await run_agent_ws(task, ws, session_id, settings)
-            except Exception as e:
-                tb = traceback.format_exc()
-                print(f"Agent error: {tb}")
-                error_msg = {"type": "error", "message": str(e)}
-                await ws.send_json(error_msg)
-                add_message(session_id, "assistant", str(e), metadata=error_msg)
+            # Send session info back to frontend
+            await ws.send_json({
+                "type": "session",
+                "session_id": session_id,
+                "title": _generate_title(content) if not client_session_id else None,
+            })
+
+            # Run agent as a background task to allow concurrent sessions
+            async def _run(sid, t, s):
+                try:
+                    await run_agent_ws(t, ws, sid, s)
+                except Exception as e:
+                    tb = traceback.format_exc()
+                    print(f"Agent error: {tb}")
+                    error_msg = {"type": "error", "session_id": sid, "message": str(e)}
+                    try:
+                        await ws.send_json(error_msg)
+                    except Exception:
+                        pass
+                    add_message(sid, "assistant", str(e), metadata=error_msg)
+                    update_session_status(sid, "error")
+                finally:
+                    _running_tasks.pop(sid, None)
+
+            task_handle = asyncio.create_task(_run(session_id, task, settings))
+            _running_tasks[session_id] = task_handle
 
     except WebSocketDisconnect:
         print("WebSocket client disconnected")
+        # Cancel running tasks for this connection
+        for task_handle in _running_tasks.values():
+            task_handle.cancel()
+        _running_tasks.clear()
 
 
 if __name__ == "__main__":

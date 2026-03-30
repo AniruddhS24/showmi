@@ -6,7 +6,6 @@ from pathlib import Path
 from uuid import uuid4
 
 SHOWMI_DIR = Path.home() / ".self-learning-browseragent"
-SCREENSHOTS_DIR = SHOWMI_DIR / "screenshots"
 LOGS_DIR = SHOWMI_DIR / "logs"
 CHATS_DIR = SHOWMI_DIR / "chats"
 WORKFLOWS_DIR = SHOWMI_DIR / "workflows"
@@ -33,7 +32,6 @@ def get_connection():
 def init_db() -> None:
     """Create the ~/.self-learning-browseragent directory structure and database tables."""
     SHOWMI_DIR.mkdir(parents=True, exist_ok=True)
-    SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
     CHATS_DIR.mkdir(parents=True, exist_ok=True)
     WORKFLOWS_DIR.mkdir(parents=True, exist_ok=True)
@@ -44,10 +42,16 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS sessions (
                 id TEXT PRIMARY KEY,
                 created_at TIMESTAMP NOT NULL,
-                title TEXT
+                title TEXT,
+                status TEXT NOT NULL DEFAULT 'idle'
             )
             """
         )
+        # Migrate: add status column if missing
+        try:
+            conn.execute("SELECT status FROM sessions LIMIT 1")
+        except sqlite3.OperationalError:
+            conn.execute("ALTER TABLE sessions ADD COLUMN status TEXT NOT NULL DEFAULT 'idle'")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS messages (
@@ -118,11 +122,30 @@ def create_session(title: str | None = None) -> str:
     return session_id
 
 
+def delete_session(session_id: str) -> None:
+    """Delete a session and all its messages."""
+    with get_connection() as conn:
+        conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+        conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+
+
+def update_session_status(session_id: str, status: str) -> None:
+    """Update the status of a session (idle, running, completed, error)."""
+    with get_connection() as conn:
+        conn.execute("UPDATE sessions SET status = ? WHERE id = ?", (status, session_id))
+
+
+def update_session_title(session_id: str, title: str) -> None:
+    """Update the title of a session."""
+    with get_connection() as conn:
+        conn.execute("UPDATE sessions SET title = ? WHERE id = ?", (title, session_id))
+
+
 def list_sessions(limit: int = 50) -> list[dict]:
     """Return recent sessions, most recent first."""
     with get_connection() as conn:
         rows = conn.execute(
-            "SELECT id, created_at, title FROM sessions ORDER BY created_at DESC LIMIT ?",
+            "SELECT id, created_at, title, status FROM sessions ORDER BY created_at DESC LIMIT ?",
             (limit,),
         ).fetchall()
     return [dict(row) for row in rows]
