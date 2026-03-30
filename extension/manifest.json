@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "Stockholm",
+  "version": "0.1.0",
+  "description": "Browser automation agent sidebar",
+  "minimum_chrome_version": "114",
+  "permissions": [
+    "sidePanel",
+    "storage",
+    "tabs",
+    "activeTab"
+  ],
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Open Stockholm"
+  }
+}
