@@ -5,7 +5,7 @@ set -e
 SHOWMI_HOME="$HOME/.showmi"
 REPO_URL="https://github.com/AniruddhS24/self-learning-browseruse.git"
 REPO_DIR="$SHOWMI_HOME/repo"
-SRC_DIR="$REPO_DIR/belgrade"
+SRC_DIR="$REPO_DIR"
 VENV_DIR="$SHOWMI_HOME/.venv"
 BIN_DIR="$SHOWMI_HOME/bin"
 LINK_DIR="$HOME/.local/bin"
@@ -74,7 +74,7 @@ ok "CLI: $LINK_DIR/showmi"
 
 # ── Initialize data directory ──
 "$VENV_DIR/bin/python" -c "from db import init_db; init_db()" 2>/dev/null || true
-ok "Data: ~/.self-learning-browseragent/"
+ok "Data: ~/.showmi/"
 
 # ── Check PATH ──
 echo ""

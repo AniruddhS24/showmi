@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
-SHOWMI_DIR = Path.home() / ".self-learning-browseragent"
+SHOWMI_DIR = Path.home() / ".showmi"
 LOGS_DIR = SHOWMI_DIR / "logs"
 CHATS_DIR = SHOWMI_DIR / "chats"
 WORKFLOWS_DIR = SHOWMI_DIR / "workflows"
@@ -30,7 +30,7 @@ def get_connection():
 
 
 def init_db() -> None:
-    """Create the ~/.self-learning-browseragent directory structure and database tables."""
+    """Create the ~/.showmi directory structure and database tables."""
     SHOWMI_DIR.mkdir(parents=True, exist_ok=True)
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
     CHATS_DIR.mkdir(parents=True, exist_ok=True)
