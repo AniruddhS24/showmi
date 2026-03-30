@@ -32,9 +32,17 @@ from db import (
     save_context_summary,
     update_session_status,
     update_session_title,
-    WORKFLOWS_DIR,
 )
 from hooks import load_workflows
+from workflow_utils import (
+    compile_recording,
+    delete_workflow,
+    get_workflow,
+    list_workflows,
+    parse_frontmatter,
+    save_workflow,
+    slugify,
+)
 
 app = FastAPI(title="Showmi Browser Agent")
 
@@ -160,15 +168,140 @@ async def get_memory():
     return {"content": get_memory_text(), "entries": list_memories()}
 
 
-@app.get("/workflows")
-async def get_workflows():
-    text = load_workflows()
-    files = []
-    if WORKFLOWS_DIR.exists():
-        for f in sorted(WORKFLOWS_DIR.glob("*.md")):
-            if f.name != "README.md":
-                files.append({"name": f.stem, "content": f.read_text()})
-    return {"combined": text, "files": files}
+# ── REST: Workflow CRUD & Compilation ──
+
+
+class WorkflowParameter(BaseModel):
+    name: str
+    description: str = ""
+    default: str = ""
+
+
+class WorkflowCreate(BaseModel):
+    name: str = ""
+    description: str = ""
+    parameters: list[WorkflowParameter] = []
+    body: str = ""
+    file_content: str = ""
+
+
+class RecordingEvent(BaseModel):
+    type: str  # click, input, navigation, select, keypress, scroll
+    timestamp: str = ""
+    url: str = ""
+    page_title: str = ""
+    target: dict = {}
+    value: str = ""
+
+
+class Recording(BaseModel):
+    start_url: str = ""
+    events: list[RecordingEvent] = []
+
+
+class CompileRequest(BaseModel):
+    name: str
+    description: str = ""
+    auto_parameterize: bool = True
+    recording: Recording
+
+
+@app.get("/api/workflows")
+async def api_list_workflows():
+    return {"workflows": list_workflows()}
+
+
+@app.post("/api/workflows/compile")
+async def api_compile_workflow(payload: CompileRequest):
+    # Resolve LLM settings from active model
+    settings = {}
+    active = get_active_model()
+    if active:
+        settings = {
+            "provider": active["provider"],
+            "model": active["model"],
+            "base_url": active["base_url"],
+            "api_key": active["api_key"],
+            "temperature": active["temperature"],
+        }
+
+    if not settings.get("api_key"):
+        return JSONResponse(
+            status_code=400,
+            content={"error": "No active model configured. Add a model first."},
+        )
+
+    try:
+        result = await compile_recording(
+            recording=payload.recording.model_dump(),
+            name=payload.name,
+            description=payload.description,
+            auto_parameterize=payload.auto_parameterize,
+            llm_settings=settings,
+        )
+        return {"workflow": result}
+    except ValueError as e:
+        # LLM output couldn't be parsed — return raw output for manual editing
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": "Could not parse LLM output into workflow format",
+                "raw_output": str(e),
+            },
+        )
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Compilation failed: {str(e)}"},
+        )
+
+
+@app.get("/api/workflows/{workflow_id}")
+async def api_get_workflow(workflow_id: str):
+    wf = get_workflow(workflow_id)
+    if not wf:
+        return JSONResponse(status_code=404, content={"error": "Workflow not found"})
+    return wf
+
+
+@app.post("/api/workflows")
+async def api_create_workflow(payload: WorkflowCreate):
+    data = payload.model_dump()
+    # Determine slug to check for conflicts
+    if data.get("file_content"):
+        meta, _ = parse_frontmatter(data["file_content"])
+        slug = slugify(meta.get("name", "untitled"))
+    elif data.get("name"):
+        slug = slugify(data["name"])
+    else:
+        return JSONResponse(
+            status_code=400, content={"error": "name or file_content required"}
+        )
+
+    if get_workflow(slug):
+        return JSONResponse(
+            status_code=409,
+            content={"error": f"Workflow '{slug}' already exists"},
+        )
+
+    wf_id = save_workflow(data)
+    return {"ok": True, "id": wf_id}
+
+
+@app.put("/api/workflows/{workflow_id}")
+async def api_update_workflow(workflow_id: str, payload: WorkflowCreate):
+    if not get_workflow(workflow_id):
+        return JSONResponse(status_code=404, content={"error": "Workflow not found"})
+    data = payload.model_dump()
+    save_workflow(data, workflow_id=workflow_id)
+    return {"ok": True, "id": workflow_id}
+
+
+@app.delete("/api/workflows/{workflow_id}")
+async def api_delete_workflow(workflow_id: str):
+    if not delete_workflow(workflow_id):
+        return JSONResponse(status_code=404, content={"error": "Workflow not found"})
+    return {"ok": True}
 
 
 @app.get("/chats/{session_id}/context")

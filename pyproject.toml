@@ -11,10 +11,11 @@ dependencies = [
     "fastapi",
     "uvicorn[standard]",
     "websockets",
+    "pyyaml>=6.0",
 ]
 
 [tool.setuptools]
-py-modules = ["main", "agent", "config", "hooks", "db", "server"]
+py-modules = ["main", "agent", "config", "hooks", "db", "server", "workflow_utils"]
 
 [project.scripts]
 showmi = "main:cli"
