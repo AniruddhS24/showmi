@@ -8,10 +8,20 @@ Self-learning browser agent with a Chrome extension sidebar UI.
 - Google Chrome
 - (Optional) [uv](https://github.com/astral-sh/uv) for faster installs
 
-## Quick start
+## Install
 
 ```bash
-git clone <repo-url> && cd belgrade
+curl -fsSL https://raw.githubusercontent.com/AniruddhS24/self-learning-browseruse/main/install.sh | sh
+```
+
+This clones the repo into `~/.showmi/`, installs dependencies, and sets up the `showmi` CLI.
+
+To uninstall, just `rm -rf ~/.showmi ~/.local/bin/showmi`.
+
+## Quick start (dev)
+
+```bash
+git clone https://github.com/AniruddhS24/self-learning-browseruse.git && cd self-learning-browseruse
 
 # Install (uses uv if available, falls back to pip)
 make install
@@ -48,7 +58,7 @@ showmi status                         Check server + config
 
 ## Configuration
 
-Models are stored in `~/.self-learning-browseragent/data.db`. You can also set defaults via `.env`:
+Models are stored in `~/.showmi/data.db`. You can also set defaults via `.env`:
 
 ```bash
 cp .env.example .env
@@ -74,7 +84,7 @@ The extension connects to the server at `ws://localhost:8765/ws`.
 ## Data directory
 
 ```
-~/.self-learning-browseragent/
+~/.showmi/
 ├── data.db              # SQLite: sessions, messages, models, memories
 ├── workflows/           # .md files injected into the agent's system prompt
 ├── chats/               # Per-session context summaries
