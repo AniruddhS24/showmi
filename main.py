@@ -367,6 +367,34 @@ def cmd_upgrade(args):
 
 
 SHOWMI_HOME = Path.home() / ".showmi"
+LINK_PATH = Path.home() / ".local" / "bin" / "showmi"
+
+
+def cmd_uninstall(args):
+    """Stop the server and remove all Showmi files."""
+    import shutil
+
+    # Stop server first
+    pid = _read_pid()
+    if pid:
+        cmd_stop(args)
+
+    confirm = input("This will delete ~/.showmi and all data. Continue? [y/N] ").strip().lower()
+    if confirm not in ("y", "yes"):
+        print("Aborted.")
+        return
+
+    # Remove symlink
+    if LINK_PATH.is_symlink() or LINK_PATH.exists():
+        LINK_PATH.unlink()
+        print(f"  Removed {LINK_PATH}")
+
+    # Remove ~/.showmi
+    if SHOWMI_HOME.exists():
+        shutil.rmtree(SHOWMI_HOME)
+        print(f"  Removed {SHOWMI_HOME}")
+
+    print("\nShowmi uninstalled.")
 
 
 def _prompt(text, default=None):
@@ -431,6 +459,9 @@ def cli():
     p_upgrade = sub.add_parser("upgrade", help="Pull latest code and reinstall")
     p_upgrade.add_argument("-p", "--port", type=int, default=8765)
 
+    # uninstall
+    sub.add_parser("uninstall", help="Remove Showmi and all data")
+
     args = parser.parse_args()
 
     if args.command is None:
@@ -448,6 +479,7 @@ def cli():
         "sessions": cmd_sessions,
         "status": cmd_status,
         "upgrade": cmd_upgrade,
+        "uninstall": cmd_uninstall,
     }
     handlers[args.command](args)
 
