@@ -5,10 +5,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
-STOCKHOLM_DIR = Path.home() / ".stockholm"
-SCREENSHOTS_DIR = STOCKHOLM_DIR / "screenshots"
-LOGS_DIR = STOCKHOLM_DIR / "logs"
-DB_PATH = STOCKHOLM_DIR / "data.db"
+DATA_DIR = Path.home() / ".self-learning-browseragent"
+SCREENSHOTS_DIR = DATA_DIR / "screenshots"
+LOGS_DIR = DATA_DIR / "logs"
+WORKFLOWS_DIR = DATA_DIR / "workflows"
+CHATS_DIR = DATA_DIR / "chats"
+DB_PATH = DATA_DIR / "data.db"
+IDENTITY_PATH = DATA_DIR / "IDENTITY.md"
+MEMORY_PATH = DATA_DIR / "MEMORY.md"
 
 
 @contextmanager
@@ -27,10 +31,12 @@ def get_connection():
 
 
 def init_db() -> None:
-    """Create the ~/.stockholm directory structure and database tables."""
-    STOCKHOLM_DIR.mkdir(parents=True, exist_ok=True)
+    """Create the ~/.self-learning-browseragent directory structure and database tables."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
     SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    WORKFLOWS_DIR.mkdir(parents=True, exist_ok=True)
+    CHATS_DIR.mkdir(parents=True, exist_ok=True)
 
     with get_connection() as conn:
         conn.execute(
@@ -55,6 +61,34 @@ def init_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS memories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                category TEXT NOT NULL,
+                content TEXT NOT NULL,
+                source_session_id TEXT,
+                created_at TIMESTAMP NOT NULL,
+                updated_at TIMESTAMP NOT NULL,
+                FOREIGN KEY (source_session_id) REFERENCES sessions(id)
+            )
+            """
+        )
+
+    # Create default IDENTITY.md if it doesn't exist
+    if not IDENTITY_PATH.exists():
+        IDENTITY_PATH.write_text(
+            "# Agent Identity\n\n"
+            "You are a helpful browser automation agent. "
+            "You help users accomplish tasks in their web browser efficiently and accurately.\n"
+        )
+
+    # Create empty MEMORY.md if it doesn't exist
+    if not MEMORY_PATH.exists():
+        MEMORY_PATH.write_text("# Agent Memory\n\nNo memories stored yet.\n")
+
+
+# ── Session CRUD ──
 
 
 def create_session(title: str | None = None) -> str:
@@ -106,3 +140,112 @@ def list_sessions() -> list[dict]:
             "SELECT id, created_at, title FROM sessions ORDER BY created_at DESC"
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+# ── Memory CRUD ──
+
+
+def add_memory(
+    category: str, content: str, source_session_id: str | None = None
+) -> int:
+    """Add a memory entry and rebuild the MEMORY.md file. Returns the new memory ID."""
+    now = datetime.now(timezone.utc).isoformat()
+    with get_connection() as conn:
+        cursor = conn.execute(
+            "INSERT INTO memories (category, content, source_session_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+            (category, content, source_session_id, now, now),
+        )
+        memory_id = cursor.lastrowid
+    rebuild_memory_file()
+    return memory_id
+
+
+def list_memories(category: str | None = None) -> list[dict]:
+    """Return all memories, optionally filtered by category, most recent first."""
+    with get_connection() as conn:
+        if category:
+            rows = conn.execute(
+                "SELECT id, category, content, source_session_id, created_at, updated_at FROM memories WHERE category = ? ORDER BY created_at DESC",
+                (category,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id, category, content, source_session_id, created_at, updated_at FROM memories ORDER BY created_at DESC"
+            ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def delete_memory(memory_id: int) -> None:
+    """Delete a memory by ID and rebuild the MEMORY.md file."""
+    with get_connection() as conn:
+        conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
+    rebuild_memory_file()
+
+
+CATEGORY_LABELS = {
+    "preference": "User Preferences",
+    "website_knowledge": "Website Knowledge",
+    "workflow_learning": "Workflow Learnings",
+    "general": "General",
+}
+
+
+def rebuild_memory_file() -> None:
+    """Read all memories from the database and write MEMORY.md grouped by category."""
+    memories = list_memories()
+    now = datetime.now(timezone.utc).isoformat()
+
+    grouped: dict[str, list[str]] = {}
+    for mem in memories:
+        cat = mem["category"]
+        grouped.setdefault(cat, []).append(mem["content"])
+
+    lines = [f"# Agent Memory\n", f"Last updated: {now}\n"]
+
+    for cat_key, label in CATEGORY_LABELS.items():
+        entries = grouped.pop(cat_key, [])
+        if entries:
+            lines.append(f"\n## {label}\n")
+            for entry in entries:
+                lines.append(f"- {entry}")
+
+    # Any categories not in CATEGORY_LABELS
+    for cat_key, entries in grouped.items():
+        if entries:
+            lines.append(f"\n## {cat_key.replace('_', ' ').title()}\n")
+            for entry in entries:
+                lines.append(f"- {entry}")
+
+    MEMORY_PATH.write_text("\n".join(lines) + "\n")
+
+
+def get_memory_text() -> str:
+    """Return the contents of MEMORY.md, or empty string if it doesn't exist."""
+    if MEMORY_PATH.exists():
+        return MEMORY_PATH.read_text()
+    return ""
+
+
+def get_identity_text() -> str:
+    """Return the contents of IDENTITY.md, or empty string if it doesn't exist."""
+    if IDENTITY_PATH.exists():
+        return IDENTITY_PATH.read_text()
+    return ""
+
+
+# ── Per-chat context ──
+
+
+def save_context_summary(session_id: str, summary: str) -> None:
+    """Write a context.md summary for a chat session."""
+    chat_dir = CHATS_DIR / session_id
+    chat_dir.mkdir(parents=True, exist_ok=True)
+    (chat_dir / "context.md").write_text(summary)
+
+
+def get_context_summary(session_id: str) -> str | None:
+    """Read the context.md for a session, or return None if it doesn't exist."""
+    context_path = CHATS_DIR / session_id / "context.md"
+    if context_path.exists():
+        return context_path.read_text()
+    return None
