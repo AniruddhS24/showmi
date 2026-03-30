@@ -11,10 +11,21 @@ from browser_use.llm.openai.chat import ChatOpenAI as BrowserUseChatOpenAI
 
 from agent import _make_browser
 from config import config as default_config
-from db import add_message, create_session, init_db
-from hooks import load_skills
+from db import (
+    add_message,
+    create_session,
+    get_context_summary,
+    get_identity_text,
+    get_memory_text,
+    get_session_messages,
+    init_db,
+    list_memories,
+    save_context_summary,
+    WORKFLOWS_DIR,
+)
+from hooks import load_workflows
 
-app = FastAPI(title="Stockholm Browser Agent")
+app = FastAPI(title="Self-Learning Browser Agent")
 
 app.add_middleware(
     CORSMiddleware,
@@ -33,6 +44,68 @@ async def startup():
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+# ── Read-only REST endpoints for extension ──
+
+
+@app.get("/identity")
+async def get_identity():
+    return {"content": get_identity_text()}
+
+
+@app.get("/memory")
+async def get_memory():
+    return {"content": get_memory_text(), "entries": list_memories()}
+
+
+@app.get("/workflows")
+async def get_workflows():
+    text = load_workflows()
+    files = []
+    if WORKFLOWS_DIR.exists():
+        for f in sorted(WORKFLOWS_DIR.glob("*.md")):
+            if f.name != "README.md":
+                files.append({"name": f.stem, "content": f.read_text()})
+    return {"combined": text, "files": files}
+
+
+@app.get("/chats/{session_id}/context")
+async def get_chat_context(session_id: str):
+    summary = get_context_summary(session_id)
+    if summary is None:
+        return {"content": None, "message": "No context summary available"}
+    return {"content": summary}
+
+
+# ── Context compression ──
+
+COMPRESSION_INTERVAL = 10
+
+
+def compress_chat_context(session_id: str, step_number: int) -> None:
+    """Build a heuristic context summary from recent messages and save to context.md."""
+    messages = get_session_messages(session_id)
+    if not messages:
+        return
+
+    summary_lines = [
+        f"# Chat Context Summary\n",
+        f"Session: {session_id}",
+        f"Steps completed: {step_number}\n",
+        "## Recent Activity\n",
+    ]
+
+    # Summarize last 10 messages
+    for msg in messages[-10:]:
+        role = msg["role"]
+        content = (msg["content"] or "")[:200]
+        summary_lines.append(f"- **{role}**: {content}")
+
+    save_context_summary(session_id, "\n".join(summary_lines) + "\n")
+
+
+# ── WebSocket step hooks ──
 
 
 def _make_step_hook(ws: WebSocket, session_id: str):
@@ -124,7 +197,26 @@ def _make_step_hook(ws: WebSocket, session_id: str):
         # Save step data to DB
         add_message(session_id, "assistant", json.dumps(msg), metadata=msg)
 
+        # Context compression every N steps
+        if step > 0 and step % COMPRESSION_INTERVAL == 0:
+            compress_chat_context(session_id, step)
+
     return on_step_start, on_step_end
+
+
+def _build_system_message() -> str | None:
+    """Combine identity, memory, and workflows into a single system message extension."""
+    parts = []
+    identity = get_identity_text()
+    if identity:
+        parts.append(identity)
+    memory = get_memory_text()
+    if memory:
+        parts.append(memory)
+    workflows = load_workflows()
+    if workflows:
+        parts.append(workflows)
+    return "\n\n---\n\n".join(parts) if parts else None
 
 
 async def run_agent_ws(task: str, ws: WebSocket, session_id: str, settings: dict) -> None:
@@ -162,9 +254,11 @@ async def run_agent_ws(task: str, ws: WebSocket, session_id: str, settings: dict
             api_key=cfg.llm_api_key,
         )
 
-    skills_text = load_skills()
-    if skills_text:
-        print(f"Loaded {skills_text.count('## Skill:')} skill(s)")
+    system_message = _build_system_message()
+    if system_message:
+        workflow_count = system_message.count("## Workflow:")
+        if workflow_count:
+            print(f"Loaded {workflow_count} workflow(s)")
 
     on_step_start, on_step_end = _make_step_hook(ws, session_id)
 
@@ -172,7 +266,7 @@ async def run_agent_ws(task: str, ws: WebSocket, session_id: str, settings: dict
         task=task,
         llm=llm,
         browser=browser,
-        extend_system_message=skills_text or None,
+        extend_system_message=system_message,
         max_actions_per_step=cfg.max_actions_per_step,
         max_failures=cfg.max_failures,
         use_vision=cfg.use_vision,
@@ -184,6 +278,9 @@ async def run_agent_ws(task: str, ws: WebSocket, session_id: str, settings: dict
         on_step_start=on_step_start,
         on_step_end=on_step_end,
     )
+
+    # Final context compression at session end
+    compress_chat_context(session_id, len(history.history))
 
     # Build and send final result
     result_msg = {

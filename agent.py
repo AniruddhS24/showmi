@@ -3,7 +3,8 @@ from browser_use.browser.profile import BrowserProfile
 from browser_use.llm.openai.chat import ChatOpenAI
 
 from config import config
-from hooks import load_skills, on_step_end, on_step_start
+from db import get_identity_text, get_memory_text
+from hooks import load_workflows, on_step_end, on_step_start
 
 
 def _make_browser(cfg=None) -> Browser:
@@ -21,6 +22,21 @@ def _make_browser(cfg=None) -> Browser:
     return Browser(browser_profile=profile)
 
 
+def _build_system_message() -> str | None:
+    """Combine identity, memory, and workflows into a single system message extension."""
+    parts = []
+    identity = get_identity_text()
+    if identity:
+        parts.append(identity)
+    memory = get_memory_text()
+    if memory:
+        parts.append(memory)
+    workflows = load_workflows()
+    if workflows:
+        parts.append(workflows)
+    return "\n\n---\n\n".join(parts) if parts else None
+
+
 async def run_agent(task: str) -> None:
     """Run the browser-use agent on the given task."""
     print(f"Task: {task}")
@@ -34,16 +50,17 @@ async def run_agent(task: str) -> None:
         api_key=config.llm_api_key,
     )
 
-    # Load any available skills
-    skills_text = load_skills()
-    if skills_text:
-        print(f"Loaded {skills_text.count('## Skill:')} skill(s)")
+    system_message = _build_system_message()
+    if system_message:
+        workflow_count = system_message.count("## Workflow:")
+        if workflow_count:
+            print(f"Loaded {workflow_count} workflow(s)")
 
     agent = Agent(
         task=task,
         llm=llm,
         browser=browser,
-        extend_system_message=skills_text or None,
+        extend_system_message=system_message,
         max_actions_per_step=config.max_actions_per_step,
         max_failures=config.max_failures,
         use_vision=config.use_vision,

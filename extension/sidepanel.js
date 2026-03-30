@@ -25,9 +25,9 @@ let settings = {
 
 // ── Settings ──
 function loadSettings() {
-  chrome.storage.local.get("stockholm_settings", (result) => {
-    if (result.stockholm_settings) {
-      settings = { ...settings, ...result.stockholm_settings };
+  chrome.storage.local.get("browseragent_settings", (result) => {
+    if (result.browseragent_settings) {
+      settings = { ...settings, ...result.browseragent_settings };
     }
     applySettingsToUI();
   });
@@ -48,7 +48,7 @@ function saveSettings() {
   settings.base_url = document.getElementById("setting-base-url").value;
   settings.model = document.getElementById("setting-model").value;
   settings.temperature = parseFloat(document.getElementById("setting-temperature").value);
-  chrome.storage.local.set({ stockholm_settings: settings });
+  chrome.storage.local.set({ browseragent_settings: settings });
   settingsOverlay.classList.add("hidden");
 }
 
