@@ -304,6 +304,71 @@ def cmd_status(args):
         print(f"Server:    not running")
 
 
+def cmd_upgrade(args):
+    """Pull latest code, reinstall dependencies, and restart server if running."""
+    import shutil
+
+    repo_dir = SHOWMI_HOME / "repo"
+    venv_dir = SHOWMI_HOME / ".venv"
+
+    if not repo_dir.exists():
+        print("Showmi repo not found. Run the install script first.")
+        return
+
+    # Pull latest
+    print("Pulling latest...", end=" ", flush=True)
+    result = subprocess.run(
+        ["git", "-C", str(repo_dir), "pull", "--ff-only"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        print("failed.")
+        print(result.stderr.strip())
+        return
+
+    output = result.stdout.strip()
+    if "Already up to date" in output:
+        print("already up to date.")
+    else:
+        print("done.")
+        # Show what changed
+        for line in output.splitlines():
+            if line.strip():
+                print(f"  {line.strip()}")
+
+    # Reinstall dependencies
+    print("Installing dependencies...", end=" ", flush=True)
+    if shutil.which("uv"):
+        subprocess.run(
+            ["uv", "pip", "install", "--python", str(venv_dir / "bin" / "python"),
+             "-e", str(repo_dir), "--quiet"],
+            capture_output=True,
+        )
+    else:
+        subprocess.run(
+            [str(venv_dir / "bin" / "pip"), "install", "-e", str(repo_dir), "--quiet"],
+            capture_output=True,
+        )
+    print("done.")
+
+    # Restart server if it was running
+    pid = _read_pid()
+    if pid:
+        print("Restarting server...", end=" ", flush=True)
+        cmd_stop(args)
+        time.sleep(0.5)
+        cmd_start(args)
+    else:
+        print("Server not running (use 'showmi start' to start).")
+
+    print("\nUpgrade complete!")
+    print(f"  Extension: {repo_dir / 'extension'}")
+    print("  Reload the extension in chrome://extensions to pick up changes.")
+
+
+SHOWMI_HOME = Path.home() / ".showmi"
+
+
 def _prompt(text, default=None):
     if default:
         text = f"{text}[{default}] "
@@ -362,6 +427,10 @@ def cli():
     p_status = sub.add_parser("status", help="Check server and config status")
     p_status.add_argument("-p", "--port", type=int, default=8765)
 
+    # upgrade
+    p_upgrade = sub.add_parser("upgrade", help="Pull latest code and reinstall")
+    p_upgrade.add_argument("-p", "--port", type=int, default=8765)
+
     args = parser.parse_args()
 
     if args.command is None:
@@ -378,6 +447,7 @@ def cli():
         "models": cmd_models,
         "sessions": cmd_sessions,
         "status": cmd_status,
+        "upgrade": cmd_upgrade,
     }
     handlers[args.command](args)
 
