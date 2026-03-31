@@ -256,10 +256,6 @@ _WORKFLOW_AGENT_OVERRIDES = {
     "use_vision": "auto",
 }
 
-# Playwright runner is disabled — all workflows run via browser-use agent with markdown
-_ENABLE_PLAYWRIGHT = False
-
-
 async def _execute_run_workflow(
     workflow_id: str,
     task_context: str,
@@ -335,11 +331,7 @@ async def _execute_start_planning(
 
     try:
         await run_planning_agent(recording, ws, session_id, settings, planning_queue)
-        finalized = getattr(planning_queue, "_finalized_workflow", None)
-        if finalized:
-            return "Workflow planning completed. The user has been asked to approve or reject."
-        else:
-            return "Workflow planning session ended."
+        return "Workflow planning completed. The user has been asked to approve or reject."
     except asyncio.CancelledError:
         return "Workflow planning was cancelled."
     except Exception as e:

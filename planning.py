@@ -420,7 +420,6 @@ async def _run_anthropic_planning(
                 if tool_name == "propose_workflow":
                     # Store proposed outputs on queue for test/approve handlers
                     queue._last_proposed_manifest = tool_input.get("manifest_yaml", "")
-                    queue._last_proposed_script = ""  # Playwright disabled
                     queue._last_proposed_markdown = tool_input.get("workflow_markdown", "")
 
                     # Save the proposed workflow to DB
@@ -561,7 +560,6 @@ async def _run_openai_planning(
 
                 if tool_name == "propose_workflow":
                     queue._last_proposed_manifest = tool_input.get("manifest_yaml", "")
-                    queue._last_proposed_script = ""  # Playwright disabled
                     queue._last_proposed_markdown = tool_input.get("workflow_markdown", "")
 
                     # Save the proposed workflow to DB

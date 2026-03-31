@@ -629,20 +629,6 @@ _planning_queues: dict[str, asyncio.Queue] = {}
 _orchestrator_queues: dict[str, asyncio.Queue] = {}
 
 
-def _build_conversation_context(session_id: str) -> str:
-    """Build a conversation history summary for multi-turn context."""
-    messages = get_session_messages(session_id)
-    if not messages:
-        return ""
-    parts = []
-    for msg in messages:
-        if msg["role"] == "user":
-            parts.append(f"User: {msg['content']}")
-        elif msg["metadata"] and msg["metadata"].get("type") == "result":
-            parts.append(f"Agent result: {msg['metadata'].get('summary', '')}")
-    return "\n".join(parts)
-
-
 def _generate_title(content: str) -> str:
     """Generate a concise title from the user's message."""
     # Simple heuristic: take first sentence, truncate to 60 chars
@@ -709,61 +695,9 @@ async def websocket_endpoint(ws: WebSocket):
                 q = _planning_queues.get(sid)
 
                 if action == "approve":
-                    # Save workflow as markdown
-                    from workflow_utils import (
-                        extract_screenshots_from_recording,
-                        render_frontmatter,
-                        slugify,
-                    )
-                    from db import WORKFLOWS_DIR
-
-                    manifest_yaml = data.get("manifest_yaml") or (getattr(q, "_last_proposed_manifest", "") if q else "")
-                    workflow_markdown = data.get("workflow_markdown") or (getattr(q, "_last_proposed_markdown", "") if q else "")
-                    recording = getattr(q, "_recording", None) if q else None
-
-                    if manifest_yaml and workflow_markdown:
-                        manifest = yaml.safe_load(manifest_yaml) or {}
-                        slug = slugify(manifest.get("name", "workflow"))
-
-                        # Create workflow directory
-                        wf_dir = WORKFLOWS_DIR / slug
-                        wf_dir.mkdir(parents=True, exist_ok=True)
-
-                        # Save manifest.yaml
-                        (wf_dir / "manifest.yaml").write_text(yaml.dump(manifest, default_flow_style=False))
-
-                        # Save workflow.md with frontmatter
-                        md_meta = {
-                            "name": manifest.get("name", slug),
-                            "description": manifest.get("description", ""),
-                            "parameters": manifest.get("parameters", []),
-                        }
-                        md_content = render_frontmatter(md_meta, workflow_markdown)
-                        (wf_dir / "workflow.md").write_text(md_content)
-
-                        # Save screenshots from recording
-                        if recording:
-                            screenshots = extract_screenshots_from_recording(recording)
-                            for fname, img_bytes in screenshots.items():
-                                (wf_dir / fname).write_bytes(img_bytes)
-
-                        wf_id = slug
-
-                        # Signal the planning agent that we're done (if still running)
-                        if q:
-                            await q.put({"type": "approve"})
-
-                        await ws.send_json({
-                            "type": "planning_complete",
-                            "session_id": sid,
-                            "workflow_id": wf_id,
-                        })
-                    else:
-                        await ws.send_json({
-                            "type": "planning_error",
-                            "session_id": sid,
-                            "message": "No proposed workflow to save. Generate a workflow first.",
-                        })
+                    if q:
+                        await q.put({"type": "approve"})
+                    await ws.send_json({"type": "planning_complete", "session_id": sid})
 
                 elif action == "reject":
                     if q:

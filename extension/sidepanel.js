@@ -671,21 +671,7 @@ function handleServerMessage(data) {
       } else if (tool === "propose_workflow") {
         lastProposedManifest = args.manifest_yaml || "";
         lastProposedMarkdown = args.workflow_markdown || args.workflow_content || "";
-        lastProposedScript = "";  // Playwright disabled
         renderWorkflowProposal(lastProposedMarkdown, lastProposedManifest);
-        if (planningBar) planningBar.classList.remove("hidden");
-      } else if (tool === "propose_script") {
-        // Legacy — treat as propose_workflow
-        lastProposedManifest = args.manifest_yaml || "";
-        lastProposedMarkdown = args.workflow_markdown || "";
-        lastProposedScript = "";
-        renderWorkflowProposal(lastProposedMarkdown, lastProposedManifest);
-        if (planningBar) planningBar.classList.remove("hidden");
-      } else if (tool === "finalize_workflow") {
-        lastProposedManifest = "";
-        lastProposedMarkdown = args.workflow_content || "";
-        lastProposedScript = "";
-        renderWorkflowProposal(lastProposedMarkdown);
         if (planningBar) planningBar.classList.remove("hidden");
       }
       break;
@@ -1136,7 +1122,6 @@ const planningTest = document.getElementById("planning-test");
 let isRecording = false;
 let currentMode = "browser"; // "browser" | "planning"
 let lastProposedManifest = null;
-let lastProposedScript = null;
 let lastProposedMarkdown = null;
 let mediaRecorder = null;
 let audioChunks = [];
@@ -1281,7 +1266,6 @@ function enterPlanningMode() {
 function exitPlanningMode() {
   currentMode = "browser";
   lastProposedManifest = null;
-  lastProposedScript = null;
   lastProposedMarkdown = null;
   if (planningBar) planningBar.classList.add("hidden");
   updateInputState();

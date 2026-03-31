@@ -15,7 +15,7 @@ from PIL import Image
 
 from db import WORKFLOWS_DIR
 
-PARAM_RE = re.compile(r"\{\{(\w+)\}\}")
+
 
 COMPILE_SYSTEM_PROMPT = """\
 You are a workflow compiler for a browser automation agent powered by browser-use. You receive \
@@ -385,45 +385,6 @@ def save_workflow(
     return wf_id
 
 
-def save_playwright_workflow(
-    slug: str,
-    manifest: dict,
-    script_code: str,
-    screenshots: dict[int, bytes] | None = None,
-) -> str:
-    """Write a playwright-format workflow directory. Returns the slug ID.
-
-    Args:
-        slug: Workflow slug ID
-        manifest: Dict with name, description, parameters, etc.
-        script_code: Python source code for workflow.py
-        screenshots: Optional dict of step_number -> JPEG bytes
-    """
-    now = datetime.now(timezone.utc).isoformat()
-    manifest.setdefault("created_at", now)
-    manifest.setdefault("updated_at", now)
-
-    wf_dir = WORKFLOWS_DIR / slug
-    wf_dir.mkdir(parents=True, exist_ok=True)
-
-    # Write manifest.yaml
-    yaml_str = yaml.dump(manifest, default_flow_style=False, sort_keys=False)
-    (wf_dir / "manifest.yaml").write_text(yaml_str)
-
-    # Write workflow.py
-    (wf_dir / "workflow.py").write_text(script_code)
-
-    # Remove legacy workflow.md if present
-    legacy_md = wf_dir / "workflow.md"
-    if legacy_md.exists():
-        legacy_md.unlink()
-
-    # Save screenshots
-    if screenshots:
-        for step_num, jpeg_bytes in screenshots.items():
-            (wf_dir / f"step-{step_num}.jpg").write_bytes(jpeg_bytes)
-
-    return slug
 
 
 def delete_workflow(workflow_id: str) -> bool:
@@ -697,74 +658,3 @@ async def compile_recording(
     }
 
 
-def extract_screenshots_from_recording(recording: dict) -> dict[int, bytes]:
-    """Extract ALL screenshots from recording events, keyed by raw event index (1-based).
-
-    Returns dict of event_index -> JPEG bytes.
-    """
-    screenshots = {}
-    for i, event in enumerate(recording.get("events", []), 1):
-        screenshot_data = event.get("screenshot", "")
-        if screenshot_data and screenshot_data.startswith("data:"):
-            b64 = screenshot_data.split(",", 1)[1] if "," in screenshot_data else ""
-            if b64:
-                try:
-                    screenshots[i] = base64.b64decode(b64)
-                except Exception:
-                    pass
-    return screenshots
-
-
-STEP_IMG_RE = re.compile(r"!\[screenshot\]\(step-(\d+)\.jpg\)")
-
-
-def select_workflow_screenshots(
-    workflow_content: str, all_screenshots: dict[int, bytes], max_screenshots: int = 10
-) -> tuple[str, dict[int, bytes]]:
-    """Match screenshot references in workflow markdown to available screenshots.
-
-    The planning agent writes ![screenshot](step-N.jpg) where N references raw event
-    indices. This function:
-    1. Finds all step-N.jpg references in the markdown
-    2. Keeps only screenshots that are referenced (capped at max_screenshots)
-    3. Renumbers them contiguously (step-1, step-2, ...)
-    4. Updates the markdown references to match
-
-    Returns (updated_workflow_content, {new_step_number: jpeg_bytes}).
-    """
-    # Find all referenced step numbers in order of appearance
-    referenced = []
-    for m in STEP_IMG_RE.finditer(workflow_content):
-        n = int(m.group(1))
-        if n not in referenced:
-            referenced.append(n)
-
-    # Filter to only those we have screenshots for
-    available = [n for n in referenced if n in all_screenshots]
-
-    # Cap at max_screenshots — keep evenly spaced if over limit
-    if len(available) > max_screenshots:
-        step = len(available) / max_screenshots
-        indices = sorted(set([0, len(available) - 1] + [int(i * step) for i in range(max_screenshots)]))
-        available = [available[i] for i in indices[:max_screenshots]]
-
-    # Build old→new mapping and collect selected screenshots
-    old_to_new = {}
-    selected = {}
-    for new_num, old_num in enumerate(available, 1):
-        old_to_new[old_num] = new_num
-        selected[new_num] = all_screenshots[old_num]
-
-    # Update markdown: renumber referenced screenshots, remove unreferenced step images
-    def replace_ref(m):
-        old_n = int(m.group(1))
-        if old_n in old_to_new:
-            return f"![screenshot](step-{old_to_new[old_n]}.jpg)"
-        # Screenshot not selected — remove the image reference line
-        return ""
-
-    updated = STEP_IMG_RE.sub(replace_ref, workflow_content)
-    # Clean up any blank lines left by removed references
-    updated = re.sub(r"\n{3,}", "\n\n", updated)
-
-    return updated, selected

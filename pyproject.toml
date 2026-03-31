@@ -16,7 +16,7 @@ dependencies = [
 ]
 
 [tool.setuptools]
-py-modules = ["main", "agent", "config", "hooks", "db", "server", "workflow_utils", "planning", "orchestrator", "workflow_runner"]
+py-modules = ["main", "agent", "config", "hooks", "db", "server", "workflow_utils", "planning", "orchestrator"]
 
 [project.scripts]
 showmi = "main:cli"
