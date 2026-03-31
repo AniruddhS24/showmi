@@ -708,7 +708,7 @@ async def websocket_endpoint(ws: WebSocket):
                 action = data.get("action", "")
                 q = _planning_queues.get(sid)
 
-                if action == "approve" and q:
+                if action == "approve":
                     # Save workflow as markdown
                     from workflow_utils import (
                         extract_screenshots_from_recording,
@@ -717,9 +717,9 @@ async def websocket_endpoint(ws: WebSocket):
                     )
                     from db import WORKFLOWS_DIR
 
-                    manifest_yaml = data.get("manifest_yaml") or getattr(q, "_last_proposed_manifest", "")
-                    workflow_markdown = data.get("workflow_markdown") or getattr(q, "_last_proposed_markdown", "")
-                    recording = getattr(q, "_recording", None)
+                    manifest_yaml = data.get("manifest_yaml") or (getattr(q, "_last_proposed_manifest", "") if q else "")
+                    workflow_markdown = data.get("workflow_markdown") or (getattr(q, "_last_proposed_markdown", "") if q else "")
+                    recording = getattr(q, "_recording", None) if q else None
 
                     if manifest_yaml and workflow_markdown:
                         manifest = yaml.safe_load(manifest_yaml) or {}
@@ -749,8 +749,9 @@ async def websocket_endpoint(ws: WebSocket):
 
                         wf_id = slug
 
-                        # Signal the planning agent that we're done
-                        await q.put({"type": "approve"})
+                        # Signal the planning agent that we're done (if still running)
+                        if q:
+                            await q.put({"type": "approve"})
 
                         await ws.send_json({
                             "type": "planning_complete",
@@ -767,10 +768,8 @@ async def websocket_endpoint(ws: WebSocket):
                 elif action == "reject":
                     if q:
                         await q.put({"type": "reject"})
-                    task_handle = _running_tasks.pop(sid, None)
-                    if task_handle:
-                        task_handle.cancel()
-                    _planning_queues.pop(sid, None)
+                    # Don't cancel the orchestrator — let planning agent return
+                    # and the orchestrator will continue its conversation loop
                     await ws.send_json({
                         "type": "planning_complete",
                         "session_id": sid,
@@ -808,7 +807,7 @@ async def websocket_endpoint(ws: WebSocket):
                             agent_overrides={
                                 "flash_mode": True,
                                 "use_thinking": False,
-                                "use_vision": False,
+                                "use_vision": "auto",
                             },
                         )
 

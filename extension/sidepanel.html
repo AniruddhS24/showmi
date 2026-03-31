@@ -25,6 +25,11 @@
           <polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/>
         </svg>
       </button>
+      <button id="workflows-btn" class="icon-btn" title="Workflows">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <polygon points="5 3 19 12 5 21 5 3"/>
+        </svg>
+      </button>
     </div>
     <div class="header-right">
       <!-- Model selector badge -->
@@ -93,6 +98,21 @@
       </div>
     </div>
     <pre id="logs-output" class="logs-output"></pre>
+  </div>
+
+  <!-- ── Workflows drawer ── -->
+  <div id="workflows-drawer" class="drawer hidden">
+    <div class="drawer-header">
+      <span class="drawer-title">workflows</span>
+      <button id="workflows-close" class="icon-btn" title="Close">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+        </svg>
+      </button>
+    </div>
+    <div class="drawer-body" id="workflows-list">
+      <!-- Populated by JS -->
+    </div>
   </div>
 
   <!-- ── Models manager overlay ── -->
@@ -228,11 +248,6 @@
       </button>
     </div>
     <div class="input-wrapper">
-      <button id="workflow-picker-btn" class="icon-btn workflow-picker-btn" title="Run a workflow">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <polygon points="5 3 19 12 5 21 5 3"/>
-        </svg>
-      </button>
       <textarea id="message-input" placeholder="what should i do?" rows="1"></textarea>
       <button id="send-btn" title="Send" disabled>
         <svg class="send-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
@@ -242,7 +257,6 @@
           <rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor"/>
         </svg>
       </button>
-      <div id="workflow-picker-dropdown" class="workflow-picker-dropdown hidden"></div>
     </div>
   </footer>
 
