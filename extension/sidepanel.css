@@ -1263,8 +1263,13 @@ body {
 #send-btn .stop-icon { display: none; }
 #send-btn.is-stop .send-icon { display: none; }
 #send-btn.is-stop .stop-icon { display: block; }
-#send-btn.is-stop { opacity: 1; color: var(--error); }
-#send-btn.is-stop:hover { background: rgba(248, 81, 73, 0.1); }
+#send-btn.is-stop {
+  opacity: 1;
+  color: var(--error);
+  background: rgba(248, 81, 73, 0.08);
+  border-radius: var(--r-sm);
+}
+#send-btn.is-stop:hover { background: rgba(248, 81, 73, 0.18); }
 
 /* ═══════════════════════════════════════
    CODE BLOCKS & TEST SCREENSHOTS

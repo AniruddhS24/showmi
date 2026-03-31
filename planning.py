@@ -490,6 +490,9 @@ async def _run_anthropic_planning(
                         })
 
                 elif tool_name == "ask_question":
+                    question_text = tool_input.get("question", "")
+                    add_message(session_id, "assistant", question_text,
+                                metadata={"type": "ask_question", **tool_input})
                     await _safe_send(ws,{
                         "type": "planning_tool_call",
                         "session_id": session_id,
@@ -612,6 +615,9 @@ async def _run_openai_planning(
                         })
 
                 elif tool_name == "ask_question":
+                    question_text = tool_input.get("question", "")
+                    add_message(session_id, "assistant", question_text,
+                                metadata={"type": "ask_question", **tool_input})
                     await _safe_send(ws,{
                         "type": "planning_tool_call",
                         "session_id": session_id,
@@ -619,6 +625,9 @@ async def _run_openai_planning(
                         "args": tool_input,
                     })
                     user_response = await queue.get()
+                    # Store the user's answer
+                    if isinstance(user_response, str):
+                        add_message(session_id, "user", user_response)
                     openai_messages.append({
                         "role": "tool",
                         "tool_call_id": tc.id,
@@ -690,6 +699,55 @@ async def run_planning_agent(
         print(f"Planning agent error: {tb}")
         try:
             await _safe_send(ws,{
+                "type": "planning_error",
+                "session_id": session_id,
+                "message": str(e),
+            })
+        except Exception:
+            pass
+
+
+async def run_planning_agent_from_context(
+    context_text: str,
+    ws: WebSocket,
+    session_id: str,
+    settings: dict,
+    queue: asyncio.Queue,
+) -> None:
+    """Run the planning agent from a conversation context (no recording needed).
+
+    Used when the user wants to save a completed browser session as a workflow.
+    """
+    try:
+        await _safe_send(ws, {
+            "type": "planning_message",
+            "session_id": session_id,
+            "content": "Creating workflow from conversation history...",
+        })
+
+        user_msg = (
+            "I want to turn the following browser automation session into a reusable workflow. "
+            "The session describes what actions the agent took, including URLs, clicks, inputs, "
+            "and results. Please analyze it and write a workflow markdown with manifest YAML.\n\n"
+            f"{context_text}"
+        )
+
+        provider = settings.get("provider", "local")
+
+        if provider == "anthropic":
+            messages = [{"role": "user", "content": user_msg}]
+            await _run_anthropic_planning(messages, settings, ws, session_id, queue)
+        else:
+            messages = [{"role": "user", "content": user_msg}]
+            await _run_openai_planning(messages, settings, ws, session_id, queue)
+
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        tb = traceback.format_exc()
+        print(f"Planning agent (from context) error: {tb}")
+        try:
+            await _safe_send(ws, {
                 "type": "planning_error",
                 "session_id": session_id,
                 "message": str(e),

@@ -10,7 +10,7 @@ import traceback
 
 from starlette.websockets import WebSocket, WebSocketState
 
-from db import add_message
+from db import add_message, get_session_messages
 from planning import (
     _make_anthropic_client,
     _make_openai_client,
@@ -23,18 +23,23 @@ ORCHESTRATOR_SYSTEM_PROMPT = """\
 You are an orchestrator for a browser automation assistant called Showmi. The user \
 talks to you naturally and you decide what to do.
 
-You have four tools:
+You have six tools:
 
 1. **run_browser_agent** — Execute a browser automation task. Use this when the user \
 wants something DONE in their browser (navigate, click, fill forms, extract data, etc.). \
 Pass a clear, detailed task description.
 
-2. **run_workflow** — Run a saved workflow by name. Use this when the user asks to run \
-a specific workflow. The workflow file will be loaded and passed to the browser agent \
+2. **run_workflow** — Run a saved workflow by name or ID. Use this when the user asks to \
+run a specific workflow. The workflow file will be loaded and passed to the browser agent \
 as detailed instructions. If the workflow has parameters (like {{destination}}), ask the \
 user for values first, then include them in the task.
 
-3. **start_recording** — Ask the user to demonstrate a workflow by recording their browser \
+3. **search_workflows** — Search or list all saved workflows. Use this when the user asks \
+about available workflows, or when you want to check if a matching workflow already exists \
+before running a browser task from scratch. Returns workflow IDs, names, descriptions, \
+and parameters.
+
+4. **start_recording** — Ask the user to demonstrate a workflow by recording their browser \
 actions. Use this when the user wants to TEACH you something new, e.g.:
    - "let me show you how to..."
    - "I want to create a workflow for..."
@@ -42,14 +47,20 @@ actions. Use this when the user wants to TEACH you something new, e.g.:
    - "teach you to do X"
    After recording completes, you will automatically receive the recording data.
 
-4. **start_planning** — Process a recorded demonstration into a reusable workflow. \
+5. **start_planning** — Process a recorded demonstration into a reusable workflow. \
 Call this IMMEDIATELY after you receive recording data from start_recording. \
 Pass the recording data as-is.
 
+6. **save_as_workflow** — Save the current session's browser actions as a reusable workflow. \
+Use when the user says "save this as a workflow", "remember how to do this", or wants to \
+create a workflow from what the agent just did (no recording needed).
+
 Guidelines:
 - For direct browser tasks → run_browser_agent
+- To find a matching workflow → search_workflows, then run_workflow with the ID
 - For running a saved workflow → run_workflow
 - For teaching/demonstrating → start_recording, then start_planning
+- To save the current session as a workflow → save_as_workflow
 - For questions or conversation → respond directly (no tool call)
 - Always briefly acknowledge what you're about to do before calling a tool
 - After a sub-agent finishes, summarize the result for the user
@@ -114,6 +125,39 @@ ANTHROPIC_TOOLS = [
         "input_schema": {
             "type": "object",
             "properties": {},
+        },
+    },
+    {
+        "name": "search_workflows",
+        "description": "Search or list all saved workflows. Returns workflow IDs, names, descriptions, and parameters. Use to find a workflow that matches the user's request before calling run_workflow.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Optional search term to filter workflows by name or description. Leave empty to list all.",
+                    "default": "",
+                },
+            },
+        },
+    },
+    {
+        "name": "save_as_workflow",
+        "description": "Save the current session's browser actions as a reusable workflow. Gathers what the agent did in this session and creates a workflow from it. Use when the user says 'save this as a workflow' or 'remember how to do this'.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "A short name for the workflow",
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Brief description of what the workflow does",
+                    "default": "",
+                },
+            },
+            "required": ["name"],
         },
     },
 ]
@@ -209,7 +253,7 @@ def _format_workflow_task(workflow: dict, task_context: str) -> str:
 _WORKFLOW_AGENT_OVERRIDES = {
     "flash_mode": True,
     "use_thinking": False,
-    "use_vision": False,
+    "use_vision": "auto",
 }
 
 # Playwright runner is disabled — all workflows run via browser-use agent with markdown
@@ -304,6 +348,106 @@ async def _execute_start_planning(
         planning_queues.pop(session_id, None)
 
 
+def _execute_search_workflows(query: str = "") -> str:
+    """Search or list all saved workflows."""
+    from workflow_utils import list_workflows
+
+    wf_list = list_workflows()
+    if not wf_list:
+        return "No workflows saved yet."
+
+    if query:
+        q = query.lower()
+        wf_list = [
+            wf for wf in wf_list
+            if q in wf.get("name", "").lower() or q in wf.get("description", "").lower()
+        ]
+
+    if not wf_list:
+        return f"No workflows matching '{query}'."
+
+    lines = []
+    for wf in wf_list:
+        params = ", ".join(p["name"] for p in wf.get("parameters", []))
+        lines.append(
+            f'- id="{wf["id"]}", name="{wf.get("name", wf["id"])}", '
+            f'description="{wf.get("description", "")}", params=[{params}]'
+        )
+    return "Available workflows:\n" + "\n".join(lines)
+
+
+async def _execute_save_as_workflow(
+    name: str,
+    description: str,
+    ws: WebSocket,
+    session_id: str,
+    settings: dict,
+    planning_queues: dict,
+) -> str:
+    """Gather conversation context and run the planning agent to create a workflow."""
+    from planning import run_planning_agent_from_context
+
+    messages = get_session_messages(session_id)
+    if not messages:
+        return "No conversation history to create a workflow from."
+
+    # Build context from session messages
+    context_lines = [f"Workflow name: {name}"]
+    if description:
+        context_lines.append(f"Description: {description}")
+    context_lines.append("\nSession history:")
+
+    for msg in messages:
+        meta = msg.get("metadata")
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except (json.JSONDecodeError, TypeError):
+                meta = None
+
+        if msg["role"] == "user":
+            context_lines.append(f"\nUser: {msg['content']}")
+        elif meta and meta.get("type") == "step":
+            actions = meta.get("actions", [])
+            goal = meta.get("goal", "")
+            url = meta.get("url", "")
+            step_num = meta.get("step_number", "?")
+            action_descs = []
+            for a in actions:
+                action_data = a.get("action", {})
+                if action_data:
+                    action_descs.append(str(action_data))
+            step_line = f"  Step {step_num}: {goal}" if goal else f"  Step {step_num}"
+            if action_descs:
+                step_line += f" -> {', '.join(action_descs)}"
+            if url:
+                step_line += f" (URL: {url})"
+            context_lines.append(step_line)
+        elif meta and meta.get("type") == "result":
+            context_lines.append(f"\nResult: {meta.get('summary', msg['content'])}")
+
+    context_text = "\n".join(context_lines)
+
+    planning_queue = asyncio.Queue()
+    planning_queues[session_id] = planning_queue
+
+    try:
+        await run_planning_agent_from_context(
+            context_text, ws, session_id, settings, planning_queue
+        )
+        proposed = getattr(planning_queue, "_last_proposed_markdown", None)
+        if proposed:
+            return "Workflow created from conversation. The user has been asked to approve or reject."
+        else:
+            return "Workflow planning session ended."
+    except asyncio.CancelledError:
+        return "Workflow planning was cancelled."
+    except Exception as e:
+        return f"Workflow planning failed: {e}"
+    finally:
+        planning_queues.pop(session_id, None)
+
+
 # ── Anthropic orchestrator loop ──
 
 
@@ -353,6 +497,8 @@ async def _run_orchestrator_anthropic(
 
                 if tool_name == "run_browser_agent":
                     task = tool_input.get("task", "")
+                    add_message(session_id, "assistant", f"[Running browser agent: {task[:200]}]",
+                                metadata={"type": "tool_call", "tool": tool_name, "args": tool_input})
                     result_text = await _execute_run_browser_agent(
                         task, ws, session_id, settings
                     )
@@ -360,12 +506,16 @@ async def _run_orchestrator_anthropic(
                 elif tool_name == "run_workflow":
                     wf_id = tool_input.get("workflow_id", "")
                     ctx = tool_input.get("task_context", "")
+                    add_message(session_id, "assistant", f"[Running workflow: {wf_id}]",
+                                metadata={"type": "tool_call", "tool": tool_name, "args": tool_input})
                     result_text = await _execute_run_workflow(
                         wf_id, ctx, ws, session_id, settings
                     )
 
                 elif tool_name == "start_recording":
                     instruction = tool_input.get("instruction", "Please demonstrate the workflow. Click Stop when done.")
+                    add_message(session_id, "assistant", instruction,
+                                metadata={"type": "tool_call", "tool": tool_name, "args": tool_input})
                     recording = await _execute_start_recording(
                         instruction, ws, session_id, queue
                     )
@@ -374,6 +524,8 @@ async def _run_orchestrator_anthropic(
                     result_text = f"Recording received with {event_count} events. Call start_planning to process it into a workflow."
 
                 elif tool_name == "start_planning":
+                    add_message(session_id, "assistant", "[Processing recording into workflow...]",
+                                metadata={"type": "tool_call", "tool": tool_name})
                     if last_recording:
                         result_text = await _execute_start_planning(
                             last_recording, ws, session_id, settings, planning_queues
@@ -381,6 +533,19 @@ async def _run_orchestrator_anthropic(
                         last_recording = None
                     else:
                         result_text = "No recording data available. Call start_recording first."
+
+                elif tool_name == "search_workflows":
+                    query = tool_input.get("query", "")
+                    result_text = _execute_search_workflows(query)
+
+                elif tool_name == "save_as_workflow":
+                    wf_name = tool_input.get("name", "workflow")
+                    wf_desc = tool_input.get("description", "")
+                    add_message(session_id, "assistant", f"[Saving session as workflow: {wf_name}]",
+                                metadata={"type": "tool_call", "tool": tool_name, "args": tool_input})
+                    result_text = await _execute_save_as_workflow(
+                        wf_name, wf_desc, ws, session_id, settings, planning_queues
+                    )
 
                 tool_results.append(
                     {
@@ -462,6 +627,8 @@ async def _run_orchestrator_openai(
 
                 if tool_name == "run_browser_agent":
                     task = tool_input.get("task", "")
+                    add_message(session_id, "assistant", f"[Running browser agent: {task[:200]}]",
+                                metadata={"type": "tool_call", "tool": tool_name, "args": tool_input})
                     result_text = await _execute_run_browser_agent(
                         task, ws, session_id, settings
                     )
@@ -469,12 +636,16 @@ async def _run_orchestrator_openai(
                 elif tool_name == "run_workflow":
                     wf_id = tool_input.get("workflow_id", "")
                     ctx = tool_input.get("task_context", "")
+                    add_message(session_id, "assistant", f"[Running workflow: {wf_id}]",
+                                metadata={"type": "tool_call", "tool": tool_name, "args": tool_input})
                     result_text = await _execute_run_workflow(
                         wf_id, ctx, ws, session_id, settings
                     )
 
                 elif tool_name == "start_recording":
                     instruction = tool_input.get("instruction", "Please demonstrate the workflow. Click Stop when done.")
+                    add_message(session_id, "assistant", instruction,
+                                metadata={"type": "tool_call", "tool": tool_name, "args": tool_input})
                     recording = await _execute_start_recording(
                         instruction, ws, session_id, queue
                     )
@@ -483,6 +654,8 @@ async def _run_orchestrator_openai(
                     result_text = f"Recording received with {event_count} events. Call start_planning to process it into a workflow."
 
                 elif tool_name == "start_planning":
+                    add_message(session_id, "assistant", "[Processing recording into workflow...]",
+                                metadata={"type": "tool_call", "tool": tool_name})
                     if last_recording:
                         result_text = await _execute_start_planning(
                             last_recording, ws, session_id, settings, planning_queues
@@ -490,6 +663,19 @@ async def _run_orchestrator_openai(
                         last_recording = None
                     else:
                         result_text = "No recording data available. Call start_recording first."
+
+                elif tool_name == "search_workflows":
+                    query = tool_input.get("query", "")
+                    result_text = _execute_search_workflows(query)
+
+                elif tool_name == "save_as_workflow":
+                    wf_name = tool_input.get("name", "workflow")
+                    wf_desc = tool_input.get("description", "")
+                    add_message(session_id, "assistant", f"[Saving session as workflow: {wf_name}]",
+                                metadata={"type": "tool_call", "tool": tool_name, "args": tool_input})
+                    result_text = await _execute_save_as_workflow(
+                        wf_name, wf_desc, ws, session_id, settings, planning_queues
+                    )
 
                 openai_messages.append(
                     {
@@ -571,7 +757,35 @@ async def run_orchestrator(
             first_msg = json.dumps(first_msg)
 
         provider = settings.get("provider", "local")
-        messages = [{"role": "user", "content": str(first_msg)}]
+
+        # Load prior conversation history from DB for multi-turn context
+        prior_messages = get_session_messages(session_id)
+        messages = []
+        for msg in prior_messages:
+            role = msg["role"]
+            content = msg["content"] or ""
+            # Skip the current message (already in first_msg) and step/result metadata
+            meta = msg.get("metadata")
+            if isinstance(meta, str):
+                try:
+                    meta = json.loads(meta)
+                except (json.JSONDecodeError, TypeError):
+                    meta = None
+            if meta and meta.get("type") in ("step", "result"):
+                continue
+            if role in ("user", "assistant") and content:
+                # Collapse consecutive same-role messages
+                if messages and messages[-1]["role"] == role:
+                    messages[-1]["content"] += "\n" + content
+                else:
+                    messages.append({"role": role, "content": content})
+
+        # Ensure conversation ends with user role (add current message)
+        if messages and messages[-1]["role"] == "user":
+            # The last user message in DB is the current one (already added by server.py)
+            pass
+        else:
+            messages.append({"role": "user", "content": str(first_msg)})
 
         if provider == "anthropic":
             await _run_orchestrator_anthropic(

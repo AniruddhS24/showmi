@@ -42,6 +42,12 @@ const logsClose = document.getElementById("logs-close");
 const logsClear = document.getElementById("logs-clear");
 const logsOutput = document.getElementById("logs-output");
 
+// Workflows drawer
+const workflowsBtn = document.getElementById("workflows-btn");
+const workflowsDrawer = document.getElementById("workflows-drawer");
+const workflowsClose = document.getElementById("workflows-close");
+const workflowsList = document.getElementById("workflows-list");
+
 // Disconnected banner
 const disconnectedBanner = document.getElementById("disconnected-banner");
 const retryConnectBtn = document.getElementById("retry-connect-btn");
@@ -1051,63 +1057,60 @@ function cancelTask() {
 }
 
 // ── Workflow picker ──
-const workflowPickerBtn = document.getElementById("workflow-picker-btn");
-const workflowPickerDropdown = document.getElementById("workflow-picker-dropdown");
+// ── Workflows drawer ──
 
-if (workflowPickerBtn && workflowPickerDropdown) {
-  workflowPickerBtn.addEventListener("click", async () => {
-    if (!workflowPickerDropdown.classList.contains("hidden")) {
-      workflowPickerDropdown.classList.add("hidden");
+if (workflowsBtn) {
+  workflowsBtn.addEventListener("click", () => {
+    workflowsDrawer.classList.remove("hidden");
+    loadWorkflows();
+  });
+}
+
+if (workflowsClose) {
+  workflowsClose.addEventListener("click", () => {
+    workflowsDrawer.classList.add("hidden");
+  });
+}
+
+async function loadWorkflows() {
+  if (!workflowsList) return;
+  workflowsList.innerHTML = '<div class="wf-picker-loading">loading...</div>';
+  try {
+    const resp = await fetch(`${API_BASE}/api/workflows`);
+    const data = await resp.json();
+    const workflows = data.workflows || [];
+
+    if (workflows.length === 0) {
+      workflowsList.innerHTML = '<div class="wf-picker-empty">no workflows saved</div>';
       return;
     }
 
-    // Fetch workflows from server
-    workflowPickerDropdown.innerHTML = '<div class="wf-picker-loading">loading...</div>';
-    workflowPickerDropdown.classList.remove("hidden");
-
-    try {
-      const resp = await fetch("http://localhost:8765/api/workflows");
-      const data = await resp.json();
-      const workflows = data.workflows || [];
-
-      if (workflows.length === 0) {
-        workflowPickerDropdown.innerHTML = '<div class="wf-picker-empty">no workflows saved</div>';
-        return;
-      }
-
-      workflowPickerDropdown.innerHTML = "";
-      for (const wf of workflows) {
-        const item = document.createElement("button");
-        item.className = "wf-picker-item";
-        item.innerHTML = `<span class="wf-picker-name">${wf.name}</span><span class="wf-picker-desc">${wf.description || ""}</span>`;
-        item.addEventListener("click", () => {
-          workflowPickerDropdown.classList.add("hidden");
-          // Send message to orchestrator to run this workflow
-          if (emptyStateEl) emptyStateEl.style.display = "none";
-          const text = `Run workflow: ${wf.name}`;
-          addMessage("user", text);
-          if (ws && ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({
-              type: "message",
-              content: text,
-              session_id: currentSessionId || undefined,
-            }));
-            showThinking();
-          }
-        });
-        workflowPickerDropdown.appendChild(item);
-      }
-    } catch {
-      workflowPickerDropdown.innerHTML = '<div class="wf-picker-empty">failed to load workflows</div>';
+    workflowsList.innerHTML = "";
+    for (const wf of workflows) {
+      const item = document.createElement("button");
+      item.className = "chat-item";
+      item.innerHTML = `<span class="chat-title">${wf.name}</span><span class="chat-date">${wf.description || ""}</span>`;
+      item.addEventListener("click", () => {
+        workflowsDrawer.classList.add("hidden");
+        // Start a new session and run the workflow
+        currentSessionId = null;
+        messagesEl.querySelectorAll(".msg, .thinking").forEach(el => el.remove());
+        if (emptyStateEl) emptyStateEl.style.display = "none";
+        const text = `Run workflow: ${wf.name}`;
+        addMessage("user", text);
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({
+            type: "message",
+            content: text,
+          }));
+          showThinking();
+        }
+      });
+      workflowsList.appendChild(item);
     }
-  });
-
-  // Close dropdown when clicking outside
-  document.addEventListener("click", (e) => {
-    if (!workflowPickerBtn.contains(e.target) && !workflowPickerDropdown.contains(e.target)) {
-      workflowPickerDropdown.classList.add("hidden");
-    }
-  });
+  } catch {
+    workflowsList.innerHTML = '<div class="wf-picker-empty">failed to load workflows</div>';
+  }
 }
 
 // ── Periodic drawer refresh ──
