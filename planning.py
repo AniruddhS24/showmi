@@ -1,0 +1,698 @@
+"""Workflow Planning Agent — generates browser-use workflow markdown from recordings.
+
+Uses raw anthropic/openai SDK clients for direct LLM conversations with tool definitions.
+"""
+
+import asyncio
+import base64
+import json
+import tempfile
+import traceback
+from pathlib import Path
+
+from starlette.websockets import WebSocket, WebSocketState
+
+from db import add_message
+from workflow_utils import (
+    _format_recording_for_llm,
+    _prefilter_events,
+)
+
+# ── System prompt ──
+
+PLANNING_SYSTEM_PROMPT = """\
+You are a Workflow Planning Agent. The user has recorded a browser demonstration and you must \
+help them turn it into a reliable, reusable browser-use workflow.
+
+The agent uses DOM elements (not screenshots) to interact with the page, so your instructions \
+must describe elements precisely by their visible text, labels, roles, and surrounding context.
+
+## Workflow Markdown Format
+
+The workflow is a markdown document with explicit, numbered steps that the browser-use agent \
+will follow. The agent reads the page DOM and executes actions based on your instructions.
+
+The markdown must follow the browser-use prompting guide for maximum reliability:
+
+```markdown
+## Task: {{name}}
+
+{{description}}
+
+Follow these steps exactly:
+
+1. Use go_to_url action to navigate to {{start_url}}.
+2. Use click action on the "{{element_text}}" link/button.
+3. Use input_text action to type "{{value}}" into the "{{field_label}}" field.
+4. Use send_keys action with "Enter" to submit.
+5. Use extract action to get all items from the page.
+6. For EACH item found:
+   a. Use click action on the item's link.
+   b. Use extract action to get the item's details.
+   c. Use go_to_url action to navigate to {{target_url}}.
+   d. Use input_text action to enter the extracted data.
+   e. Use go_back action to return to the list.
+7. Use done action to report results.
+
+If a click action fails, use send_keys action with "Tab Tab Enter" as fallback.
+If navigation fails, use go_to_url action to retry from the last known URL.
+If a page doesn't load, use wait action then refresh.
+```
+
+## Critical Rules for Markdown
+
+1. **Reference actions by EXACT name**: go_to_url, click, input_text, send_keys, extract, \
+scroll_down, scroll_up, scroll_to_text, go_back, wait, done, search
+2. **Be VERY specific about elements**: Use the exact visible text, aria-labels, or roles from \
+the recording. Never say "click the button" — say 'Use click action on the "Submit" button' or \
+'Use click action on the link with text "View Profile"'.
+3. **Describe elements by their DOM context**: Since the agent reads the DOM (not screenshots), \
+describe elements by their text content, labels, placeholder text, or surrounding context. \
+For example: 'the input field labeled "Email"', 'the link "People" in the navigation bar'.
+4. **Include keyboard fallbacks**: For every click/input step, add a fallback using send_keys \
+(Tab, Enter, Arrow keys) in case the element can't be found.
+5. **Loops**: If the user demonstrated 1-2 iterations of a repeated action, write instructions \
+that handle ALL items. Write "For EACH item found:" with sub-steps using letters (a, b, c...).
+6. **Use {{param}} placeholders** for parameterized values that change between runs.
+7. **Include error recovery** instructions at the end of the workflow.
+8. **Be explicit about waits**: After navigation, say "wait for the page to load". After \
+clicking something that opens a new view, say "wait for the content to appear".
+
+## Manifest YAML
+
+A manifest YAML defines name, description, and parameters:
+
+```yaml
+name: research_group_profiler
+description: Extract researcher profiles and add them to a Google Sheet tracker
+parameters:
+  - name: university
+    description: Target university
+    default: UC Berkeley
+  - name: research_field
+    description: Research area to search for
+    default: NLP
+  - name: spreadsheet_url
+    description: Google Sheet URL
+    default: ""
+```
+
+## Your Process
+
+1. Analyze the recording to understand the task
+2. Ask 1-2 clarifying questions if needed (use ask_question tool)
+3. Write the workflow markdown and manifest YAML
+4. Propose via propose_workflow tool
+5. The user will Test, give feedback, or Approve
+6. On test failure: you'll see the error. Fix the instructions and re-propose.
+7. On user feedback: incorporate changes and re-propose.
+8. On approve: the system saves the workflow. You're done.
+
+## Recording Context
+
+When you receive the recording, pay attention to:
+- URLs visited (these become go_to_url steps)
+- Elements clicked (their text, aria-labels, roles → specific element descriptions)
+- Text typed (becomes input_text steps)
+- DOM context around each element (helps the agent find the right element)
+- Repeated patterns (become "For EACH..." loop instructions)
+
+Generate the workflow markdown immediately from the recording. Be practical and specific. \
+The agent uses DOM elements to find things, so the more precise your element descriptions, \
+the better it will work.\
+"""
+
+
+# ── Tool definitions ──
+
+ANTHROPIC_TOOLS = [
+    {
+        "name": "propose_workflow",
+        "description": "Show the proposed workflow to the user for review. "
+        "The user can then Test, Approve, Reject, or give feedback.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "manifest_yaml": {
+                    "type": "string",
+                    "description": "YAML manifest with name, description, and parameters",
+                },
+                "workflow_markdown": {
+                    "type": "string",
+                    "description": "Browser-use workflow markdown — explicit numbered steps referencing actions by exact name. The agent uses DOM elements (not screenshots) to find and interact with page elements.",
+                },
+            },
+            "required": ["manifest_yaml", "workflow_markdown"],
+        },
+    },
+    {
+        "name": "ask_question",
+        "description": "Ask the user a question. Use for clarifications about the workflow.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "question": {"type": "string", "description": "The question to ask"},
+                "choices": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional list of choices. Omit for free text.",
+                },
+            },
+            "required": ["question"],
+        },
+    },
+]
+
+OPENAI_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": t["name"],
+            "description": t["description"],
+            "parameters": t["input_schema"],
+        },
+    }
+    for t in ANTHROPIC_TOOLS
+]
+
+
+async def _safe_send(ws: WebSocket, data: dict) -> bool:
+    """Send JSON over WebSocket, returning False if connection is closed."""
+    try:
+        if ws.client_state == WebSocketState.CONNECTED:
+            await ws.send_json(data)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+# ── Audio transcription ──
+
+
+async def transcribe_audio(audio_b64: str, settings: dict) -> str:
+    """Transcribe audio using OpenAI Whisper API.
+
+    Only works with OpenAI provider. Returns empty string for other providers.
+    """
+    if not audio_b64 or settings.get("provider") != "openai":
+        return ""
+
+    try:
+        import openai
+
+        if audio_b64.startswith("data:"):
+            audio_b64 = audio_b64.split(",", 1)[1] if "," in audio_b64 else ""
+        if not audio_b64:
+            return ""
+
+        audio_bytes = base64.b64decode(audio_b64)
+        with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as f:
+            f.write(audio_bytes)
+            tmp_path = f.name
+
+        client = openai.AsyncOpenAI(
+            api_key=settings.get("api_key", ""),
+            base_url=settings.get("base_url") or None,
+        )
+        with open(tmp_path, "rb") as audio_file:
+            transcript = await client.audio.transcriptions.create(
+                model="whisper-1",
+                file=audio_file,
+            )
+
+        Path(tmp_path).unlink(missing_ok=True)
+        return transcript.text
+    except Exception as e:
+        print(f"Audio transcription failed: {e}")
+        return ""
+
+
+# ── Event curation ──
+
+CURATE_SYSTEM_PROMPT = """\
+You are an event curation agent. You receive a list of raw browser interaction events \
+from a recorded demonstration and must select only the ESSENTIAL events that represent \
+the core workflow.
+
+Your job:
+- Identify the meaningful high-level actions (navigate, click a link, fill a form field, \
+submit, select an option).
+- DISCARD events that are: redundant clicks (re-clicking the same thing), fumbling/mistakes \
+(clicking wrong things then going back), scroll events, intermediate page loads, \
+duplicate navigations, or events that don't contribute to the task.
+- Merge sequences that represent one logical action (e.g., click on input + type = one action).
+- Keep events that show DIFFERENT pages or DIFFERENT UI states — if two events produce \
+the same visual result, keep only one.
+- If the workflow has a repeating pattern (e.g., "visit profile, copy info, paste in sheet, \
+go back" repeated N times), keep ONE full iteration of the loop plus the setup steps.
+
+Output ONLY a JSON object with:
+- "selected": list of event indices (1-based) to keep, in order
+- "reasoning": one sentence explaining what the core workflow is
+
+Keep the selected list to 5-12 events maximum. Prefer fewer over more.\
+"""
+
+
+def _format_events_compact(events: list[dict]) -> str:
+    """Format events as a compact numbered list for the curation agent."""
+    lines = []
+    for i, event in enumerate(events, 1):
+        target = event.get("target", {})
+        desc = target.get("aria_label") or target.get("text") or target.get("selector", "")
+        url = event.get("url", "")
+        value = event.get("value", "")
+        has_screenshot = bool(event.get("screenshot"))
+        line = f"{i}. [{event.get('type', '?')}] target={desc!r} url={url!r}"
+        if value:
+            line += f" value={value!r}"
+        if has_screenshot:
+            line += " [screenshot]"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+async def _curate_events_anthropic(
+    events: list[dict], audio_transcript: str, settings: dict
+) -> list[int]:
+    """Use Anthropic to select important event indices."""
+    client = _make_anthropic_client(settings)
+    model = settings.get("model", "claude-sonnet-4-20250514")
+
+    user_msg = _format_events_compact(events)
+    if audio_transcript:
+        user_msg = f"User narration: {audio_transcript}\n\n{user_msg}"
+
+    response = await client.messages.create(
+        model=model,
+        max_tokens=1024,
+        system=CURATE_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": user_msg}],
+    )
+
+    text = response.content[0].text.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1] if "\n" in text else text[3:]
+    if text.endswith("```"):
+        text = text[:-3]
+    text = text.strip()
+
+    result = json.loads(text)
+    return result.get("selected", [])
+
+
+async def _curate_events_openai(
+    events: list[dict], audio_transcript: str, settings: dict
+) -> list[int]:
+    """Use OpenAI to select important event indices."""
+    client = _make_openai_client(settings)
+    model = settings.get("model", "gpt-4o")
+
+    user_msg = _format_events_compact(events)
+    if audio_transcript:
+        user_msg = f"User narration: {audio_transcript}\n\n{user_msg}"
+
+    response = await client.chat.completions.create(
+        model=model,
+        max_tokens=1024,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": CURATE_SYSTEM_PROMPT},
+            {"role": "user", "content": user_msg},
+        ],
+    )
+
+    text = response.choices[0].message.content.strip()
+    result = json.loads(text)
+    return result.get("selected", [])
+
+
+async def curate_events(
+    events: list[dict], audio_transcript: str, settings: dict
+) -> list[dict]:
+    """Select important events from a recording using an LLM curation step.
+
+    Returns the filtered list of events (preserving original event dicts).
+    Falls back to all events if curation fails.
+    """
+    if len(events) <= 12:
+        return events
+
+    try:
+        provider = settings.get("provider", "local")
+        if provider == "anthropic":
+            selected_indices = await _curate_events_anthropic(events, audio_transcript, settings)
+        else:
+            selected_indices = await _curate_events_openai(events, audio_transcript, settings)
+
+        curated = []
+        for idx in selected_indices:
+            if isinstance(idx, int) and 1 <= idx <= len(events):
+                curated.append(events[idx - 1])
+
+        if curated:
+            print(f"Event curation: {len(events)} events → {len(curated)} selected")
+            return curated
+
+    except Exception as e:
+        print(f"Event curation failed, using all events: {e}")
+
+    return events
+
+
+# ── LLM client helpers ──
+
+
+def _make_anthropic_client(settings: dict):
+    import anthropic
+    return anthropic.AsyncAnthropic(api_key=settings.get("api_key", ""))
+
+
+def _make_openai_client(settings: dict):
+    import openai
+    return openai.AsyncOpenAI(
+        api_key=settings.get("api_key", "not-needed"),
+        base_url=settings.get("base_url") or None,
+    )
+
+
+# ── Anthropic planning loop ──
+
+
+async def _run_anthropic_planning(
+    messages: list,
+    settings: dict,
+    ws: WebSocket,
+    session_id: str,
+    queue: asyncio.Queue,
+) -> None:
+    """Run the planning conversation loop using Anthropic's API."""
+    client = _make_anthropic_client(settings)
+    model = settings.get("model", "claude-sonnet-4-20250514")
+
+    while True:
+        response = await client.messages.create(
+            model=model,
+            max_tokens=8192,
+            system=PLANNING_SYSTEM_PROMPT,
+            tools=ANTHROPIC_TOOLS,
+            messages=messages,
+        )
+
+        assistant_content = response.content
+        messages.append({"role": "assistant", "content": assistant_content})
+
+        tool_results = []
+
+        for block in assistant_content:
+            if block.type == "text" and block.text.strip():
+                add_message(session_id, "assistant", block.text)
+                await _safe_send(ws,{
+                    "type": "planning_message",
+                    "session_id": session_id,
+                    "content": block.text,
+                })
+            elif block.type == "tool_use":
+                tool_name = block.name
+                tool_input = block.input
+
+                if tool_name == "propose_workflow":
+                    # Store proposed outputs on queue for test/approve handlers
+                    queue._last_proposed_manifest = tool_input.get("manifest_yaml", "")
+                    queue._last_proposed_script = ""  # Playwright disabled
+                    queue._last_proposed_markdown = tool_input.get("workflow_markdown", "")
+
+                    # Save the proposed workflow to DB
+                    add_message(session_id, "assistant",
+                                "Proposed workflow:\n\n" + tool_input.get("workflow_markdown", ""),
+                                metadata={"type": "workflow_proposal",
+                                          "manifest_yaml": tool_input.get("manifest_yaml", ""),
+                                          "workflow_markdown": tool_input.get("workflow_markdown", "")})
+
+                    await _safe_send(ws,{
+                        "type": "planning_tool_call",
+                        "session_id": session_id,
+                        "tool": "propose_workflow",
+                        "args": tool_input,
+                    })
+
+                    # Block until user Tests, Approves, Rejects, or gives feedback
+                    user_response = await queue.get()
+
+                    # Handle structured responses
+                    if isinstance(user_response, dict):
+                        if user_response.get("type") == "approve":
+                            tool_results.append({
+                                "type": "tool_result",
+                                "tool_use_id": block.id,
+                                "content": "User approved the workflow. It has been saved.",
+                            })
+                            messages.append({"role": "user", "content": tool_results})
+                            return
+                        elif user_response.get("type") == "reject":
+                            tool_results.append({
+                                "type": "tool_result",
+                                "tool_use_id": block.id,
+                                "content": "User rejected the workflow.",
+                            })
+                            messages.append({"role": "user", "content": tool_results})
+                            return
+                        elif user_response.get("type") == "test_result":
+                            if user_response.get("success"):
+                                tool_results.append({
+                                    "type": "tool_result",
+                                    "tool_use_id": block.id,
+                                    "content": f"Test PASSED. Output: {user_response.get('result_text', '')}",
+                                })
+                            else:
+                                err_msg = f"Test FAILED.\nError: {user_response.get('error', 'Unknown')}"
+                                tb = user_response.get("traceback", "")
+                                if tb:
+                                    err_msg += f"\nTraceback:\n{tb}"
+                                tool_results.append({
+                                    "type": "tool_result",
+                                    "tool_use_id": block.id,
+                                    "content": err_msg,
+                                })
+                        else:
+                            tool_results.append({
+                                "type": "tool_result",
+                                "tool_use_id": block.id,
+                                "content": json.dumps(user_response),
+                            })
+                    else:
+                        # Plain text feedback
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": f"User feedback: {user_response}",
+                        })
+
+                elif tool_name == "ask_question":
+                    await _safe_send(ws,{
+                        "type": "planning_tool_call",
+                        "session_id": session_id,
+                        "tool": tool_name,
+                        "args": tool_input,
+                    })
+                    user_response = await queue.get()
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": str(user_response),
+                    })
+
+        if tool_results:
+            messages.append({"role": "user", "content": tool_results})
+        elif response.stop_reason == "end_turn":
+            user_response = await queue.get()
+            if isinstance(user_response, dict) and user_response.get("type") in ("approve", "reject"):
+                return
+            messages.append({"role": "user", "content": str(user_response)})
+
+
+# ── OpenAI planning loop ──
+
+
+async def _run_openai_planning(
+    messages: list,
+    settings: dict,
+    ws: WebSocket,
+    session_id: str,
+    queue: asyncio.Queue,
+) -> None:
+    """Run the planning conversation loop using OpenAI's API."""
+    client = _make_openai_client(settings)
+    model = settings.get("model", "gpt-4o")
+
+    openai_messages = [{"role": "system", "content": PLANNING_SYSTEM_PROMPT}] + messages
+
+    while True:
+        response = await client.chat.completions.create(
+            model=model,
+            max_tokens=8192,
+            tools=OPENAI_TOOLS,
+            messages=openai_messages,
+        )
+
+        choice = response.choices[0]
+        message = choice.message
+        openai_messages.append(message.model_dump(exclude_none=True))
+
+        if message.content:
+            add_message(session_id, "assistant", message.content)
+            await _safe_send(ws,{
+                "type": "planning_message",
+                "session_id": session_id,
+                "content": message.content,
+            })
+
+        if message.tool_calls:
+            for tc in message.tool_calls:
+                tool_name = tc.function.name
+                try:
+                    tool_input = json.loads(tc.function.arguments)
+                except json.JSONDecodeError:
+                    tool_input = {}
+
+                if tool_name == "propose_workflow":
+                    queue._last_proposed_manifest = tool_input.get("manifest_yaml", "")
+                    queue._last_proposed_script = ""  # Playwright disabled
+                    queue._last_proposed_markdown = tool_input.get("workflow_markdown", "")
+
+                    # Save the proposed workflow to DB
+                    add_message(session_id, "assistant",
+                                "Proposed workflow:\n\n" + tool_input.get("workflow_markdown", ""),
+                                metadata={"type": "workflow_proposal",
+                                          "manifest_yaml": tool_input.get("manifest_yaml", ""),
+                                          "workflow_markdown": tool_input.get("workflow_markdown", "")})
+
+                    await _safe_send(ws,{
+                        "type": "planning_tool_call",
+                        "session_id": session_id,
+                        "tool": "propose_workflow",
+                        "args": tool_input,
+                    })
+
+                    user_response = await queue.get()
+
+                    if isinstance(user_response, dict):
+                        if user_response.get("type") in ("approve", "reject"):
+                            openai_messages.append({
+                                "role": "tool",
+                                "tool_call_id": tc.id,
+                                "content": f"User {'approved' if user_response['type'] == 'approve' else 'rejected'} the workflow.",
+                            })
+                            return
+                        elif user_response.get("type") == "test_result":
+                            if user_response.get("success"):
+                                content = f"Test PASSED. Output: {user_response.get('result_text', '')}"
+                            else:
+                                content = f"Test FAILED.\nError: {user_response.get('error', 'Unknown')}"
+                                tb = user_response.get("traceback", "")
+                                if tb:
+                                    content += f"\nTraceback:\n{tb}"
+                            openai_messages.append({
+                                "role": "tool",
+                                "tool_call_id": tc.id,
+                                "content": content,
+                            })
+                        else:
+                            openai_messages.append({
+                                "role": "tool",
+                                "tool_call_id": tc.id,
+                                "content": json.dumps(user_response),
+                            })
+                    else:
+                        openai_messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": f"User feedback: {user_response}",
+                        })
+
+                elif tool_name == "ask_question":
+                    await _safe_send(ws,{
+                        "type": "planning_tool_call",
+                        "session_id": session_id,
+                        "tool": tool_name,
+                        "args": tool_input,
+                    })
+                    user_response = await queue.get()
+                    openai_messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": str(user_response),
+                    })
+        elif choice.finish_reason == "stop":
+            user_response = await queue.get()
+            if isinstance(user_response, dict) and user_response.get("type") in ("approve", "reject"):
+                return
+            openai_messages.append({"role": "user", "content": str(user_response)})
+
+
+# ── Main entry point ──
+
+
+async def run_planning_agent(
+    recording: dict,
+    ws: WebSocket,
+    session_id: str,
+    settings: dict,
+    queue: asyncio.Queue,
+) -> None:
+    """Run the workflow planning agent conversation.
+
+    Transcribes audio, formats the recording, then enters a conversation loop
+    where the agent writes a hybrid Playwright script for the workflow.
+    """
+    try:
+        audio_transcript = await transcribe_audio(
+            recording.get("audio_b64", ""), settings
+        )
+
+        raw_events = recording.get("events", [])
+        filtered_events = _prefilter_events(raw_events)
+
+        await _safe_send(ws,{
+            "type": "planning_message",
+            "session_id": session_id,
+            "content": f"Analyzing {len(raw_events)} recorded events...",
+        })
+
+        curated_events = await curate_events(filtered_events, audio_transcript, settings)
+
+        curated_recording = {**recording, "events": curated_events}
+        formatted = _format_recording_for_llm(curated_recording, audio_transcript)
+
+        # Store recording on queue for screenshot extraction on approve
+        queue._recording = curated_recording
+
+        user_msg = (
+            f"I just recorded a browser demonstration. "
+            f"Please analyze it and write a hybrid Playwright + browser-use workflow script.\n\n"
+            f"{formatted}"
+        )
+
+        provider = settings.get("provider", "local")
+
+        if provider == "anthropic":
+            messages = [{"role": "user", "content": user_msg}]
+            await _run_anthropic_planning(messages, settings, ws, session_id, queue)
+        else:
+            messages = [{"role": "user", "content": user_msg}]
+            await _run_openai_planning(messages, settings, ws, session_id, queue)
+
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        tb = traceback.format_exc()
+        print(f"Planning agent error: {tb}")
+        try:
+            await _safe_send(ws,{
+                "type": "planning_error",
+                "session_id": session_id,
+                "message": str(e),
+            })
+        except Exception:
+            pass

@@ -35,6 +35,13 @@ const editorSave = document.getElementById("editor-save");
 const tempSlider = document.getElementById("edit-temperature");
 const tempValue = document.getElementById("temp-value");
 
+// Logs drawer
+const logsBtn = document.getElementById("logs-btn");
+const logsDrawer = document.getElementById("logs-drawer");
+const logsClose = document.getElementById("logs-close");
+const logsClear = document.getElementById("logs-clear");
+const logsOutput = document.getElementById("logs-output");
+
 // Disconnected banner
 const disconnectedBanner = document.getElementById("disconnected-banner");
 const retryConnectBtn = document.getElementById("retry-connect-btn");
@@ -198,6 +205,8 @@ async function loadChat(sessionId) {
         } else if (meta.type === "error") {
           addMessage("error", meta.message || msg.content);
           stepTraceEl = null;
+        } else if (meta.type === "workflow_proposal") {
+          renderWorkflowProposal(meta.workflow_markdown || msg.content, meta.manifest_yaml);
         } else {
           addMessage("agent", msg.content);
         }
@@ -215,6 +224,67 @@ async function loadChat(sessionId) {
   } catch {
     addMessage("error", "Failed to load chat history");
   }
+}
+
+// ── Logs drawer ──
+let logsWs = null;
+
+logsBtn.addEventListener("click", () => {
+  const isOpen = !logsDrawer.classList.contains("hidden");
+  if (isOpen) {
+    closeLogsDrawer();
+  } else {
+    openLogsDrawer();
+  }
+});
+
+logsClose.addEventListener("click", closeLogsDrawer);
+
+logsClear.addEventListener("click", () => {
+  logsOutput.textContent = "";
+});
+
+function openLogsDrawer() {
+  logsDrawer.classList.remove("hidden");
+  connectLogStream();
+}
+
+function closeLogsDrawer() {
+  logsDrawer.classList.add("hidden");
+  if (logsWs) {
+    try { logsWs.close(); } catch {}
+    logsWs = null;
+  }
+}
+
+function connectLogStream() {
+  if (logsWs && logsWs.readyState === WebSocket.OPEN) return;
+
+  logsOutput.textContent = "";
+  logsWs = new WebSocket("ws://localhost:8765/ws/logs");
+
+  logsWs.addEventListener("message", (event) => {
+    const line = event.data;
+    const span = document.createElement("span");
+    span.textContent = line + "\n";
+
+    // Color-code by level
+    if (/ ERROR /.test(line)) span.className = "log-line-error";
+    else if (/ WARN/.test(line)) span.className = "log-line-warn";
+
+    logsOutput.appendChild(span);
+
+    // Auto-scroll to bottom
+    logsOutput.scrollTop = logsOutput.scrollHeight;
+
+    // Cap rendered lines
+    while (logsOutput.childElementCount > 500) {
+      logsOutput.removeChild(logsOutput.firstChild);
+    }
+  });
+
+  logsWs.addEventListener("close", () => { logsWs = null; });
+  logsWs.addEventListener("error", () => {});
 }
 
 // ── Model selector (badge dropdown) ──
@@ -547,6 +617,116 @@ function handleServerMessage(data) {
       break;
     }
 
+    case "cancelled": {
+      const state = getSessionState(msgSessionId);
+      state.isWorking = false;
+      state.stepTraceEl = null;
+      if (msgSessionId === currentSessionId) {
+        removeThinking();
+        addMessage("system", "Task cancelled.");
+        updateInputState();
+      }
+      break;
+    }
+
+    case "orchestrator_message":
+      removeThinking();
+      addMessage("agent", data.content || "");
+      break;
+
+    case "orchestrator_command":
+      if (data.command === "start_recording") {
+        removeThinking();
+        addMessage("agent", data.instruction || "Please demonstrate the workflow. Click Stop when done.");
+        startRecordingFromOrchestrator();
+      }
+      break;
+
+    case "planning_message":
+      removeThinking();
+      addMessage("agent", data.content || "");
+      showThinking();
+      break;
+
+    case "planning_tool_call": {
+      removeThinking();
+      const tool = data.tool;
+      const args = data.args || {};
+      if (tool === "ask_multiple_choice") {
+        renderMultipleChoice(args.question, args.choices || [], data.session_id);
+      } else if (tool === "ask_free_text" || tool === "ask_question") {
+        if (args.choices && args.choices.length > 0) {
+          renderMultipleChoice(args.question, args.choices, data.session_id);
+        } else {
+          addMessage("agent", args.question || "");
+          inputEl.placeholder = args.placeholder || "type your answer...";
+          inputEl.focus();
+        }
+      } else if (tool === "propose_workflow") {
+        lastProposedManifest = args.manifest_yaml || "";
+        lastProposedMarkdown = args.workflow_markdown || args.workflow_content || "";
+        lastProposedScript = "";  // Playwright disabled
+        renderWorkflowProposal(lastProposedMarkdown, lastProposedManifest);
+        if (planningBar) planningBar.classList.remove("hidden");
+      } else if (tool === "propose_script") {
+        // Legacy — treat as propose_workflow
+        lastProposedManifest = args.manifest_yaml || "";
+        lastProposedMarkdown = args.workflow_markdown || "";
+        lastProposedScript = "";
+        renderWorkflowProposal(lastProposedMarkdown, lastProposedManifest);
+        if (planningBar) planningBar.classList.remove("hidden");
+      } else if (tool === "finalize_workflow") {
+        lastProposedManifest = "";
+        lastProposedMarkdown = args.workflow_content || "";
+        lastProposedScript = "";
+        renderWorkflowProposal(lastProposedMarkdown);
+        if (planningBar) planningBar.classList.remove("hidden");
+      }
+      break;
+    }
+
+    case "planning_complete":
+      removeThinking();
+      exitPlanningMode();
+      if (planningApprove) { planningApprove.disabled = false; planningApprove.textContent = "approve"; }
+      if (planningTest) { planningTest.disabled = false; planningTest.textContent = "test"; }
+      addMessage("system", data.workflow_id ? `Workflow saved: ${data.workflow_id}` : "Workflow discarded.");
+      break;
+
+    case "planning_error":
+      removeThinking();
+      addMessage("error", data.message || "Planning error");
+      exitPlanningMode();
+      break;
+
+    case "test_start":
+      addMessage("system", "Running workflow test...");
+      if (planningTest) { planningTest.disabled = true; planningTest.textContent = "testing..."; }
+      break;
+
+    case "test_result": {
+      if (planningTest) { planningTest.disabled = false; planningTest.textContent = "test"; }
+      if (data.success) {
+        addMessage("system", `Test passed in ${(data.duration_ms / 1000).toFixed(1)}s. ${data.return_value || ""}`);
+      } else {
+        let errorMsg = `Test failed: ${data.error || "Unknown error"}`;
+        if (data.traceback) {
+          errorMsg += `\n\`\`\`\n${data.traceback}\n\`\`\``;
+        }
+        addMessage("error", errorMsg);
+        if (data.screenshot) {
+          const img = document.createElement("img");
+          img.src = `data:image/jpeg;base64,${data.screenshot}`;
+          img.className = "test-error-screenshot";
+          img.alt = "Screenshot at time of error";
+          messagesEl.appendChild(img);
+          scrollToBottom();
+        }
+      }
+      showThinking(); // agent will respond to test result
+      break;
+    }
+
     default:
       if (data.content) addMessage("agent", data.content);
   }
@@ -614,10 +794,20 @@ async function sendMessage() {
   inputEl.value = "";
   autoResizeInput();
 
+  if (currentMode === "planning") {
+    // In planning mode, send as planning response
+    ws.send(JSON.stringify({
+      type: "planning_response",
+      session_id: currentSessionId,
+      content: text,
+    }));
+    showThinking();
+    return;
+  }
+
   const payload = {
-    type: "task",
+    type: "message",
     content: text,
-    settings: {},
     active_tab: attachedTab, // only included if badge is visible
   };
 
@@ -799,7 +989,16 @@ function updateSendState() {
   const hasText = inputEl.value.trim().length > 0;
   const connected = ws && ws.readyState === WebSocket.OPEN;
   const isWorking = currentSessionId ? getSessionState(currentSessionId).isWorking : false;
-  sendBtn.disabled = isWorking || !hasText || !connected;
+
+  if (isWorking) {
+    sendBtn.disabled = false;
+    sendBtn.classList.add("is-stop");
+    sendBtn.title = "Stop";
+  } else {
+    sendBtn.classList.remove("is-stop");
+    sendBtn.title = "Send";
+    sendBtn.disabled = !hasText || !connected;
+  }
 }
 
 // ── Markdown-lite ──
@@ -834,7 +1033,82 @@ function autoResizeInput() {
   inputEl.style.height = Math.min(inputEl.scrollHeight, 100) + "px";
 }
 
-sendBtn.addEventListener("click", sendMessage);
+sendBtn.addEventListener("click", () => {
+  if (sendBtn.classList.contains("is-stop")) {
+    cancelTask();
+  } else {
+    sendMessage();
+  }
+});
+
+function cancelTask() {
+  if (!currentSessionId || !ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({
+    type: "cancel",
+    session_id: currentSessionId,
+  }));
+  sendBtn.disabled = true;
+}
+
+// ── Workflow picker ──
+const workflowPickerBtn = document.getElementById("workflow-picker-btn");
+const workflowPickerDropdown = document.getElementById("workflow-picker-dropdown");
+
+if (workflowPickerBtn && workflowPickerDropdown) {
+  workflowPickerBtn.addEventListener("click", async () => {
+    if (!workflowPickerDropdown.classList.contains("hidden")) {
+      workflowPickerDropdown.classList.add("hidden");
+      return;
+    }
+
+    // Fetch workflows from server
+    workflowPickerDropdown.innerHTML = '<div class="wf-picker-loading">loading...</div>';
+    workflowPickerDropdown.classList.remove("hidden");
+
+    try {
+      const resp = await fetch("http://localhost:8765/api/workflows");
+      const data = await resp.json();
+      const workflows = data.workflows || [];
+
+      if (workflows.length === 0) {
+        workflowPickerDropdown.innerHTML = '<div class="wf-picker-empty">no workflows saved</div>';
+        return;
+      }
+
+      workflowPickerDropdown.innerHTML = "";
+      for (const wf of workflows) {
+        const item = document.createElement("button");
+        item.className = "wf-picker-item";
+        item.innerHTML = `<span class="wf-picker-name">${wf.name}</span><span class="wf-picker-desc">${wf.description || ""}</span>`;
+        item.addEventListener("click", () => {
+          workflowPickerDropdown.classList.add("hidden");
+          // Send message to orchestrator to run this workflow
+          if (emptyStateEl) emptyStateEl.style.display = "none";
+          const text = `Run workflow: ${wf.name}`;
+          addMessage("user", text);
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+              type: "message",
+              content: text,
+              session_id: currentSessionId || undefined,
+            }));
+            showThinking();
+          }
+        });
+        workflowPickerDropdown.appendChild(item);
+      }
+    } catch {
+      workflowPickerDropdown.innerHTML = '<div class="wf-picker-empty">failed to load workflows</div>';
+    }
+  });
+
+  // Close dropdown when clicking outside
+  document.addEventListener("click", (e) => {
+    if (!workflowPickerBtn.contains(e.target) && !workflowPickerDropdown.contains(e.target)) {
+      workflowPickerDropdown.classList.add("hidden");
+    }
+  });
+}
 
 // ── Periodic drawer refresh ──
 // Refresh chat list status every 3 seconds if drawer is open
@@ -844,195 +1118,286 @@ setInterval(() => {
   }
 }, 3000);
 
-// ── Recording ──
+// ── Recording (orchestrator-driven) ──
 
-const recordBtn = document.getElementById("record-btn");
-const stopBtn = document.getElementById("stop-btn");
-const eventCountEl = document.getElementById("event-count");
+const recordingOverlay = document.getElementById("recording-overlay");
+const overlayStopBtn = document.getElementById("overlay-stop-btn");
+const overlayEventCount = document.getElementById("overlay-event-count");
 
-// Workflow review overlay
-const workflowReview = document.getElementById("workflow-review");
-const reviewClose = document.getElementById("review-close");
-const wfNameInput = document.getElementById("wf-name");
-const wfDescInput = document.getElementById("wf-description");
-const wfParamsEl = document.getElementById("wf-params");
-const wfStepsEl = document.getElementById("wf-steps");
-const wfErrorEl = document.getElementById("wf-error");
-const reviewDiscard = document.getElementById("review-discard");
-const reviewSave = document.getElementById("review-save");
+// Planning mode
+const planningBar = document.getElementById("planning-bar");
+const planningApprove = document.getElementById("planning-approve");
+const planningReject = document.getElementById("planning-reject");
+const planningTest = document.getElementById("planning-test");
 
 let isRecording = false;
-let compiledWorkflow = null;
+let currentMode = "browser"; // "browser" | "planning"
+let lastProposedManifest = null;
+let lastProposedScript = null;
+let lastProposedMarkdown = null;
+let mediaRecorder = null;
+let audioChunks = [];
 
-// Start recording
-recordBtn.addEventListener("click", () => {
-  chrome.runtime.sendMessage({ type: "START_RECORDING" }, (response) => {
-    if (response?.ok) {
-      isRecording = true;
-      recordBtn.classList.add("hidden");
-      stopBtn.classList.remove("hidden");
-      eventCountEl.textContent = "0";
-      document.body.classList.add("recording-active");
-      inputEl.disabled = true;
-      inputEl.placeholder = "recording...";
-      sendBtn.disabled = true;
-    }
-  });
-});
+// Audio capture helpers
+async function startAudioCapture() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    audioChunks = [];
+    mediaRecorder = new MediaRecorder(stream, { mimeType: "audio/webm;codecs=opus" });
+    mediaRecorder.ondataavailable = (e) => {
+      if (e.data.size > 0) audioChunks.push(e.data);
+    };
+    mediaRecorder.start(1000); // collect chunks every 1s
+  } catch {
+    // No mic permission — continue without audio
+    mediaRecorder = null;
+  }
+}
 
-// Stop recording
-stopBtn.addEventListener("click", () => {
-  chrome.runtime.sendMessage({ type: "STOP_RECORDING" }, async (data) => {
-    isRecording = false;
-    stopBtn.classList.add("hidden");
-    recordBtn.classList.remove("hidden");
-    document.body.classList.remove("recording-active");
-
-    if (!data || !data.events || data.events.length === 0) {
-      addMessage("error", "No events were recorded.");
-      updateInputState();
+function stopAudioCapture() {
+  return new Promise((resolve) => {
+    if (!mediaRecorder || mediaRecorder.state === "inactive") {
+      resolve("");
       return;
     }
+    mediaRecorder.onstop = () => {
+      // Stop all tracks on the stream
+      mediaRecorder.stream.getTracks().forEach((t) => t.stop());
+      if (audioChunks.length === 0) { resolve(""); return; }
+      const blob = new Blob(audioChunks, { type: "audio/webm;codecs=opus" });
+      const reader = new FileReader();
+      reader.onloadend = () => resolve(reader.result); // data:audio/webm;...base64,...
+      reader.readAsDataURL(blob);
+    };
+    mediaRecorder.stop();
+  });
+}
 
-    // Hide empty state
-    if (emptyStateEl) emptyStateEl.style.display = "none";
+// Start recording (triggered by orchestrator command)
+async function startRecordingFromOrchestrator() {
+  chrome.runtime.sendMessage({ type: "START_RECORDING" }, async (response) => {
+    if (response?.ok) {
+      isRecording = true;
+      if (recordingOverlay) recordingOverlay.classList.remove("hidden");
+      if (overlayEventCount) overlayEventCount.textContent = "0";
+      document.body.classList.add("recording-active");
+      inputEl.disabled = true;
+      inputEl.placeholder = "recording... speak to narrate";
+      sendBtn.disabled = true;
+      await startAudioCapture();
+    }
+  });
+}
 
-    addMessage("system", `Compiling ${data.events.length} recorded events...`);
-    showThinking();
+// Stop recording (sends recording_complete to server → orchestrator queue)
+if (overlayStopBtn) {
+  overlayStopBtn.addEventListener("click", () => {
+    chrome.runtime.sendMessage({ type: "STOP_RECORDING" }, async (data) => {
+      isRecording = false;
+      if (recordingOverlay) recordingOverlay.classList.add("hidden");
+      document.body.classList.remove("recording-active");
 
-    try {
-      const res = await fetch(`${API_BASE}/api/workflows/compile`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          name: "Untitled Workflow",
-          description: "",
-          auto_parameterize: true,
-          recording: {
-            start_url: data.startUrl,
-            events: data.events,
-          },
-        }),
-      });
-
-      removeThinking();
-
-      if (!res.ok) {
-        const err = await res.json();
-        addMessage("error", err.error || "Compilation failed");
+      if (!data || !data.events || data.events.length === 0) {
+        addMessage("error", "No events were recorded.");
         updateInputState();
         return;
       }
 
-      const result = await res.json();
-      compiledWorkflow = result.workflow;
-      showWorkflowReview(compiledWorkflow);
-    } catch (e) {
-      removeThinking();
-      addMessage("error", `Compilation error: ${e.message}`);
-      updateInputState();
-    }
+      const audio_b64 = await stopAudioCapture();
+
+      if (emptyStateEl) emptyStateEl.style.display = "none";
+      addMessage("system", `Recorded ${data.events.length} events.`);
+      showThinking();
+
+      // Send recording back to orchestrator
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+          type: "recording_complete",
+          session_id: currentSessionId,
+          recording: {
+            start_url: data.startUrl,
+            events: data.events,
+            audio_b64: audio_b64,
+          },
+        }));
+        enterPlanningMode();
+      } else {
+        removeThinking();
+        addMessage("error", "Not connected to server.");
+        updateInputState();
+      }
+    });
   });
-});
+}
 
 // Live event count from background
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg.type === "RECORDING_EVENT_COUNT" && isRecording) {
-    eventCountEl.textContent = String(msg.count);
+    if (overlayEventCount) overlayEventCount.textContent = String(msg.count);
   }
 });
 
-// ── Workflow review overlay ──
+// ── Planning mode ──
 
-function showWorkflowReview(workflow) {
-  wfNameInput.value = workflow.name || "";
-  wfDescInput.value = workflow.description || "";
-  wfErrorEl.classList.add("hidden");
-
-  // Render parameters
-  const params = workflow.parameters || [];
-  if (params.length) {
-    wfParamsEl.innerHTML = '<div class="wf-params-title">parameters</div>';
-    params.forEach((p) => {
-      const item = document.createElement("div");
-      item.className = "wf-param-item";
-      item.innerHTML = `<span class="wf-param-name">{{${escapeHtml(p.name)}}}</span> ${escapeHtml(p.description || "")}`;
-      wfParamsEl.appendChild(item);
-    });
-  } else {
-    wfParamsEl.innerHTML = "";
-  }
-
-  // Render steps (body markdown)
-  wfStepsEl.innerHTML = renderMarkdown(workflow.body || "");
-
-  workflowReview.classList.remove("hidden");
+function enterPlanningMode() {
+  currentMode = "planning";
+  // Planning bar stays hidden until a workflow is proposed
+  inputEl.disabled = false;
+  inputEl.placeholder = "reply to the planning agent...";
+  sendBtn.disabled = false;
 }
 
-function hideWorkflowReview() {
-  workflowReview.classList.add("hidden");
-  compiledWorkflow = null;
+function exitPlanningMode() {
+  currentMode = "browser";
+  lastProposedManifest = null;
+  lastProposedScript = null;
+  lastProposedMarkdown = null;
+  if (planningBar) planningBar.classList.add("hidden");
   updateInputState();
 }
 
-reviewClose.addEventListener("click", hideWorkflowReview);
-reviewDiscard.addEventListener("click", hideWorkflowReview);
+function renderMultipleChoice(question, choices, sessionId) {
+  const wrapper = document.createElement("div");
+  wrapper.className = "msg agent";
 
-workflowReview.addEventListener("click", (e) => {
-  if (e.target === workflowReview) hideWorkflowReview();
-});
+  const q = document.createElement("div");
+  q.className = "msg-content";
+  q.innerHTML = renderMarkdown(question);
+  wrapper.appendChild(q);
 
-reviewSave.addEventListener("click", async () => {
-  if (!compiledWorkflow) return;
-
-  const name = wfNameInput.value.trim() || compiledWorkflow.name;
-  const description = wfDescInput.value.trim() || compiledWorkflow.description;
-
-  try {
-    reviewSave.disabled = true;
-    reviewSave.textContent = "saving...";
-
-    const res = await fetch(`${API_BASE}/api/workflows`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        name,
-        description,
-        parameters: compiledWorkflow.parameters,
-        body: compiledWorkflow.body,
-      }),
+  const choicesRow = document.createElement("div");
+  choicesRow.className = "planning-choices";
+  choices.forEach((choice) => {
+    const btn = document.createElement("button");
+    btn.className = "planning-choice-btn";
+    btn.textContent = choice;
+    btn.addEventListener("click", () => {
+      // Disable all choice buttons after selection
+      choicesRow.querySelectorAll("button").forEach((b) => { b.disabled = true; b.classList.remove("selected"); });
+      btn.classList.add("selected");
+      // Send response
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "planning_response", session_id: sessionId, content: choice }));
+      }
+      showThinking();
     });
+    choicesRow.appendChild(btn);
+  });
+  wrapper.appendChild(choicesRow);
 
-    if (res.status === 409) {
-      wfErrorEl.textContent = "A workflow with this name already exists. Change the name.";
-      wfErrorEl.classList.remove("hidden");
-      reviewSave.disabled = false;
-      reviewSave.textContent = "save workflow";
-      return;
-    }
+  messagesEl.appendChild(wrapper);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+}
 
-    if (!res.ok) {
-      const err = await res.json();
-      wfErrorEl.textContent = err.error || "Save failed";
-      wfErrorEl.classList.remove("hidden");
-      reviewSave.disabled = false;
-      reviewSave.textContent = "save workflow";
-      return;
-    }
+function renderWorkflowProposal(content, manifestYaml) {
+  const wrapper = document.createElement("div");
+  wrapper.className = "msg agent";
 
-    // Success
-    workflowReview.classList.add("hidden");
-    compiledWorkflow = null;
-    addMessage("system", `Workflow "${name}" saved.`);
-    updateInputState();
-  } catch (e) {
-    wfErrorEl.textContent = `Error: ${e.message}`;
-    wfErrorEl.classList.remove("hidden");
-  } finally {
-    reviewSave.disabled = false;
-    reviewSave.textContent = "save workflow";
+  // Show manifest if provided
+  if (manifestYaml) {
+    const manifestCard = document.createElement("details");
+    manifestCard.className = "workflow-card";
+    manifestCard.open = false;
+    const manifestSummary = document.createElement("summary");
+    manifestSummary.textContent = "Manifest (parameters)";
+    manifestCard.appendChild(manifestSummary);
+    const manifestBody = document.createElement("pre");
+    manifestBody.className = "code-block";
+    manifestBody.textContent = manifestYaml;
+    manifestCard.appendChild(manifestBody);
+    wrapper.appendChild(manifestCard);
   }
-});
+
+  const card = document.createElement("details");
+  card.className = "workflow-card";
+  card.open = true;
+  const summary = document.createElement("summary");
+  summary.textContent = "Proposed Workflow";
+  card.appendChild(summary);
+  const body = document.createElement("div");
+  body.className = "workflow-card-body";
+  body.innerHTML = renderMarkdown(content);
+  card.appendChild(body);
+  wrapper.appendChild(card);
+  messagesEl.appendChild(wrapper);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
+function renderScriptProposal(manifestYaml, scriptCode) {
+  const wrapper = document.createElement("div");
+  wrapper.className = "msg agent";
+
+  // Manifest card
+  const manifestCard = document.createElement("details");
+  manifestCard.className = "workflow-card";
+  manifestCard.open = false;
+  const manifestSummary = document.createElement("summary");
+  manifestSummary.textContent = "Manifest (parameters)";
+  manifestCard.appendChild(manifestSummary);
+  const manifestBody = document.createElement("pre");
+  manifestBody.className = "code-block";
+  manifestBody.textContent = manifestYaml;
+  manifestCard.appendChild(manifestBody);
+  wrapper.appendChild(manifestCard);
+
+  // Script card
+  const scriptCard = document.createElement("details");
+  scriptCard.className = "workflow-card";
+  scriptCard.open = true;
+  const scriptSummary = document.createElement("summary");
+  scriptSummary.textContent = "Workflow Script";
+  scriptCard.appendChild(scriptSummary);
+  const scriptBody = document.createElement("pre");
+  scriptBody.className = "code-block";
+  const codeEl = document.createElement("code");
+  codeEl.textContent = scriptCode;
+  scriptBody.appendChild(codeEl);
+  scriptCard.appendChild(scriptBody);
+  wrapper.appendChild(scriptCard);
+
+  messagesEl.appendChild(wrapper);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
+// Planning action buttons
+if (planningApprove) {
+  planningApprove.addEventListener("click", () => {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({
+        type: "planning_action",
+        session_id: currentSessionId,
+        action: "approve",
+        manifest_yaml: lastProposedManifest,
+        script_code: lastProposedScript,
+        workflow_markdown: lastProposedMarkdown,
+      }));
+      planningApprove.disabled = true;
+      planningApprove.textContent = "saving...";
+    }
+  });
+}
+
+if (planningReject) {
+  planningReject.addEventListener("click", () => {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "planning_action", session_id: currentSessionId, action: "reject" }));
+    }
+    addMessage("system", "Workflow discarded.");
+    exitPlanningMode();
+  });
+}
+
+if (planningTest) {
+  planningTest.addEventListener("click", () => {
+    if (ws && ws.readyState === WebSocket.OPEN && lastProposedMarkdown) {
+      ws.send(JSON.stringify({ type: "planning_action", session_id: currentSessionId, action: "test" }));
+      planningTest.disabled = true;
+      planningTest.textContent = "testing...";
+    } else {
+      addMessage("system", "No workflow to test. Wait for a workflow proposal first.");
+    }
+  });
+}
 
 // ── Init ──
 initTheme();

@@ -3,6 +3,7 @@ import json
 import traceback
 
 import uvicorn
+import yaml
 from browser_use import Agent
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,6 +14,7 @@ from pydantic import BaseModel
 
 from agent import _make_browser
 from config import config as default_config
+from planning import run_planning_agent
 from db import (
     add_message,
     create_session,
@@ -55,6 +57,14 @@ app.add_middleware(
 )
 
 
+# ── Log streaming ──
+# Tail the persistent log file at ~/.showmi/logs/server.log for the /ws/logs endpoint.
+
+import re as _re
+
+_ANSI_RE = _re.compile(r"\x1b\[[0-9;]*m")
+
+
 @app.on_event("startup")
 async def startup():
     init_db()
@@ -63,6 +73,42 @@ async def startup():
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.websocket("/ws/logs")
+async def websocket_logs(ws: WebSocket):
+    """Tail ~/.showmi/logs/server.log and stream to the client."""
+    from db import LOGS_DIR
+
+    await ws.accept()
+    log_path = LOGS_DIR / "server.log"
+
+    try:
+        if not log_path.exists():
+            await ws.send_text("(no log file yet — start server with `showmi start`)")
+            # Wait for file to appear
+            while not log_path.exists():
+                await asyncio.sleep(1)
+
+        with open(log_path, "r") as f:
+            # Send last 200 lines as backlog
+            lines = f.readlines()
+            for line in lines[-200:]:
+                clean = _ANSI_RE.sub("", line.rstrip())
+                if clean:
+                    await ws.send_text(clean)
+
+            # Tail new lines
+            while True:
+                line = f.readline()
+                if line:
+                    clean = _ANSI_RE.sub("", line.rstrip())
+                    if clean:
+                        await ws.send_text(clean)
+                else:
+                    await asyncio.sleep(0.3)
+    except Exception:
+        pass
 
 
 # ── REST: Sessions ──
@@ -192,11 +238,14 @@ class RecordingEvent(BaseModel):
     page_title: str = ""
     target: dict = {}
     value: str = ""
+    dom_context: str = ""  # filtered DOM elements around the interaction
+    screenshot: str = ""  # base64 JPEG data URL
 
 
 class Recording(BaseModel):
     start_url: str = ""
     events: list[RecordingEvent] = []
+    audio_b64: str = ""  # base64 webm audio from microphone
 
 
 class CompileRequest(BaseModel):
@@ -435,22 +484,35 @@ def _make_step_hook(ws: WebSocket, session_id: str):
     return on_step_start, on_step_end
 
 
-def _build_system_message() -> str | None:
-    """Combine identity, memory, and workflows into a single system message extension."""
+def _build_system_message() -> tuple[str | None, list]:
+    """Combine identity, memory, and workflows into system message text + images.
+
+    Returns (text, image_paths) where image_paths is a list of Path objects
+    for workflow screenshots that should be included as multimodal content.
+    """
     parts = []
+    image_paths = []
+
     identity = get_identity_text()
     if identity:
         parts.append(identity)
     memory = get_memory_text()
     if memory:
         parts.append(memory)
+
     workflows = load_workflows()
     if workflows:
-        parts.append(workflows)
-    return "\n\n---\n\n".join(parts) if parts else None
+        workflow_texts = []
+        for wf in workflows:
+            workflow_texts.append(wf["text"])
+            image_paths.extend(wf["images"])
+        parts.append("# Available Workflows\n\n" + "\n\n---\n\n".join(workflow_texts))
+
+    text = "\n\n---\n\n".join(parts) if parts else None
+    return text, image_paths
 
 
-async def run_agent_ws(task: str, ws: WebSocket, session_id: str, settings: dict) -> None:
+async def run_agent_ws(task: str, ws: WebSocket, session_id: str, settings: dict, agent_overrides: dict | None = None) -> None:
     """Run the browser-use agent, streaming updates over a WebSocket."""
 
     cfg = default_config
@@ -483,7 +545,8 @@ async def run_agent_ws(task: str, ws: WebSocket, session_id: str, settings: dict
             api_key=cfg.llm_api_key,
         )
 
-    system_message = _build_system_message()
+    system_message, _workflow_images = _build_system_message()
+    # TODO: inject _workflow_images as multimodal content when browser-use supports it
     if system_message:
         workflow_count = system_message.count("## Workflow:")
         if workflow_count:
@@ -491,15 +554,24 @@ async def run_agent_ws(task: str, ws: WebSocket, session_id: str, settings: dict
 
     on_step_start, on_step_end = _make_step_hook(ws, session_id)
 
-    agent = Agent(
-        task=task,
-        llm=llm,
-        browser=browser,
-        extend_system_message=system_message,
-        max_actions_per_step=cfg.max_actions_per_step,
-        max_failures=cfg.max_failures,
-        use_vision=cfg.use_vision,
-    )
+    from config import _parse_use_vision
+
+    agent_kwargs = {
+        "task": task,
+        "llm": llm,
+        "browser": browser,
+        "extend_system_message": system_message,
+        "max_actions_per_step": cfg.max_actions_per_step,
+        "max_failures": cfg.max_failures,
+        "use_vision": _parse_use_vision(cfg.use_vision),
+        "flash_mode": cfg.flash_mode,
+        "use_thinking": cfg.use_thinking,
+        "vision_detail_level": cfg.vision_detail_level,
+        "max_history_items": cfg.max_history_items or None,
+    }
+    if agent_overrides:
+        agent_kwargs.update(agent_overrides)
+    agent = Agent(**agent_kwargs)
 
     print("Running agent...\n")
     update_session_status(session_id, "running")
@@ -537,6 +609,8 @@ async def run_agent_ws(task: str, ws: WebSocket, session_id: str, settings: dict
     # Mark completed — the agent finished successfully even if some steps had errors
     update_session_status(session_id, "completed")
 
+    result_summary = result_msg["summary"] or f"Completed in {len(history.history)} steps."
+
     print(f"\n{'='*60}")
     print("Agent finished")
     print(f"{'='*60}")
@@ -546,9 +620,13 @@ async def run_agent_ws(task: str, ws: WebSocket, session_id: str, settings: dict
     if error_strings:
         print(f"Errors: {error_strings}")
 
+    return result_summary
+
 
 # ── Track running tasks per WebSocket ──
 _running_tasks: dict[str, asyncio.Task] = {}
+_planning_queues: dict[str, asyncio.Queue] = {}
+_orchestrator_queues: dict[str, asyncio.Queue] = {}
 
 
 def _build_conversation_context(session_id: str) -> str:
@@ -583,6 +661,22 @@ def _generate_title(content: str) -> str:
     return text or "New chat"
 
 
+def _resolve_settings(data_settings: dict | None = None) -> dict:
+    """Resolve LLM settings from provided data or active model in DB."""
+    settings = data_settings or {}
+    if not settings.get("api_key"):
+        active = get_active_model()
+        if active:
+            settings = {
+                "provider": active["provider"],
+                "model": active["model"],
+                "base_url": active["base_url"],
+                "api_key": active["api_key"],
+                "temperature": active["temperature"],
+            }
+    return settings
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
@@ -595,75 +689,249 @@ async def websocket_endpoint(ws: WebSocket):
                 await ws.send_json({"type": "error", "message": "Invalid JSON"})
                 continue
 
-            if data.get("type") != "task":
-                await ws.send_json({"type": "error", "message": f"Unknown message type: {data.get('type')}"})
+            msg_type = data.get("type")
+
+            # ── Planning: user response to agent question ──
+            if msg_type == "planning_response":
+                sid = data.get("session_id", "")
+                content = data.get("content", "")
+                if sid and content:
+                    add_message(sid, "user", content)
+                q = _planning_queues.get(sid)
+                if q:
+                    await q.put(content)
                 continue
 
-            content = data.get("content", "")
-            settings = data.get("settings", {})
-            active_tab = data.get("active_tab")
-            client_session_id = data.get("session_id")
+            # ── Planning: approve / reject / test ──
+            if msg_type == "planning_action":
+                sid = data.get("session_id", "")
+                action = data.get("action", "")
+                q = _planning_queues.get(sid)
 
-            if not content:
-                await ws.send_json({"type": "error", "message": "Empty task content"})
-                continue
+                if action == "approve" and q:
+                    # Save workflow as markdown
+                    from workflow_utils import (
+                        extract_screenshots_from_recording,
+                        render_frontmatter,
+                        slugify,
+                    )
+                    from db import WORKFLOWS_DIR
 
-            # If no settings provided, use the active model from DB
-            if not settings.get("api_key"):
-                active = get_active_model()
-                if active:
-                    settings = {
-                        "provider": active["provider"],
-                        "model": active["model"],
-                        "base_url": active["base_url"],
-                        "api_key": active["api_key"],
-                        "temperature": active["temperature"],
-                    }
+                    manifest_yaml = data.get("manifest_yaml") or getattr(q, "_last_proposed_manifest", "")
+                    workflow_markdown = data.get("workflow_markdown") or getattr(q, "_last_proposed_markdown", "")
+                    recording = getattr(q, "_recording", None)
 
-            # Reuse existing session or create new one
-            if client_session_id:
-                session_id = client_session_id
-                # Build conversation context for multi-turn
-                conversation_history = _build_conversation_context(session_id)
-            else:
-                title = _generate_title(content)
-                session_id = create_session(title=title)
-                conversation_history = ""
+                    if manifest_yaml and workflow_markdown:
+                        manifest = yaml.safe_load(manifest_yaml) or {}
+                        slug = slugify(manifest.get("name", "workflow"))
 
-            add_message(session_id, "user", content)
+                        # Create workflow directory
+                        wf_dir = WORKFLOWS_DIR / slug
+                        wf_dir.mkdir(parents=True, exist_ok=True)
 
-            task = content
-            if conversation_history:
-                task = f"[Previous conversation in this session]\n{conversation_history}\n\n[New user request]\n{content}"
-            if active_tab and active_tab.get("url"):
-                task = f"[User is currently on: {active_tab['url']} — \"{active_tab.get('title', '')}\"]\n\n{task}"
+                        # Save manifest.yaml
+                        (wf_dir / "manifest.yaml").write_text(yaml.dump(manifest, default_flow_style=False))
 
-            # Send session info back to frontend
-            await ws.send_json({
-                "type": "session",
-                "session_id": session_id,
-                "title": _generate_title(content) if not client_session_id else None,
-            })
+                        # Save workflow.md with frontmatter
+                        md_meta = {
+                            "name": manifest.get("name", slug),
+                            "description": manifest.get("description", ""),
+                            "parameters": manifest.get("parameters", []),
+                        }
+                        md_content = render_frontmatter(md_meta, workflow_markdown)
+                        (wf_dir / "workflow.md").write_text(md_content)
 
-            # Run agent as a background task to allow concurrent sessions
-            async def _run(sid, t, s):
-                try:
-                    await run_agent_ws(t, ws, sid, s)
-                except Exception as e:
-                    tb = traceback.format_exc()
-                    print(f"Agent error: {tb}")
-                    error_msg = {"type": "error", "session_id": sid, "message": str(e)}
+                        # Save screenshots from recording
+                        if recording:
+                            screenshots = extract_screenshots_from_recording(recording)
+                            for fname, img_bytes in screenshots.items():
+                                (wf_dir / fname).write_bytes(img_bytes)
+
+                        wf_id = slug
+
+                        # Signal the planning agent that we're done
+                        await q.put({"type": "approve"})
+
+                        await ws.send_json({
+                            "type": "planning_complete",
+                            "session_id": sid,
+                            "workflow_id": wf_id,
+                        })
+                    else:
+                        await ws.send_json({
+                            "type": "planning_error",
+                            "session_id": sid,
+                            "message": "No proposed workflow to save. Generate a workflow first.",
+                        })
+
+                elif action == "reject":
+                    if q:
+                        await q.put({"type": "reject"})
+                    task_handle = _running_tasks.pop(sid, None)
+                    if task_handle:
+                        task_handle.cancel()
+                    _planning_queues.pop(sid, None)
+                    await ws.send_json({
+                        "type": "planning_complete",
+                        "session_id": sid,
+                        "workflow_id": None,
+                    })
+
+                elif action == "test" and q:
+                    workflow_markdown = getattr(q, "_last_proposed_markdown", "")
+                    manifest_yaml = getattr(q, "_last_proposed_manifest", "")
+                    if not workflow_markdown:
+                        await ws.send_json({
+                            "type": "planning_error",
+                            "session_id": sid,
+                            "message": "No workflow to test. Generate a workflow first.",
+                        })
+                        continue
+
+                    manifest = yaml.safe_load(manifest_yaml) or {}
+
+                    # Substitute default param values into markdown
+                    task = workflow_markdown
+                    for p in manifest.get("parameters", []):
+                        pname = p.get("name", "")
+                        default = p.get("default", "")
+                        if pname and default:
+                            task = task.replace(f"{{{{{pname}}}}}", default)
+
+                    await ws.send_json({"type": "test_start", "session_id": sid})
+
                     try:
-                        await ws.send_json(error_msg)
-                    except Exception:
-                        pass
-                    add_message(sid, "assistant", str(e), metadata=error_msg)
-                    update_session_status(sid, "error")
-                finally:
-                    _running_tasks.pop(sid, None)
+                        settings = _resolve_settings(data.get("settings"))
+                        # Run via browser-use agent with DOM (no screenshots)
+                        result = await run_agent_ws(
+                            task, ws, sid, settings,
+                            agent_overrides={
+                                "flash_mode": True,
+                                "use_thinking": False,
+                                "use_vision": False,
+                            },
+                        )
 
-            task_handle = asyncio.create_task(_run(session_id, task, settings))
-            _running_tasks[session_id] = task_handle
+                        await ws.send_json({
+                            "type": "test_result",
+                            "session_id": sid,
+                            "success": True,
+                            "return_value": result or "Workflow completed.",
+                            "error": "",
+                            "traceback": "",
+                        })
+
+                        # Feed test result back to planning agent
+                        await q.put({"type": "test_result", "success": True, "result_text": result or ""})
+
+                    except Exception as e:
+                        tb = traceback.format_exc()
+                        await ws.send_json({
+                            "type": "test_result",
+                            "session_id": sid,
+                            "success": False,
+                            "error": str(e),
+                            "traceback": tb,
+                        })
+                        await q.put({"type": "test_result", "success": False, "error": str(e), "traceback": tb})
+                continue
+
+            # ── Recording complete: feed into orchestrator queue ──
+            if msg_type == "recording_complete":
+                sid = data.get("session_id", "")
+                q = _orchestrator_queues.get(sid)
+                if q:
+                    await q.put({"type": "recording", "data": data.get("recording", {})})
+                continue
+
+            # ── User message: route to orchestrator ──
+            if msg_type == "message":
+                from orchestrator import run_orchestrator
+
+                content = data.get("content", "")
+                settings = _resolve_settings(data.get("settings"))
+                active_tab = data.get("active_tab")
+                client_session_id = data.get("session_id")
+
+                if not content:
+                    await ws.send_json({"type": "error", "message": "Empty message"})
+                    continue
+
+                if not settings.get("api_key"):
+                    await ws.send_json({"type": "error", "message": "No active model configured."})
+                    continue
+
+                # Reuse existing session or create new one
+                if client_session_id:
+                    session_id = client_session_id
+                else:
+                    title = _generate_title(content)
+                    session_id = create_session(title=title)
+
+                add_message(session_id, "user", content)
+
+                # Prepend active tab context if present
+                user_content = content
+                if active_tab and active_tab.get("url"):
+                    user_content = f"[User is currently on: {active_tab['url']} — \"{active_tab.get('title', '')}\"]\n\n{content}"
+
+                await ws.send_json({
+                    "type": "session",
+                    "session_id": session_id,
+                    "title": _generate_title(content) if not client_session_id else None,
+                })
+
+                # Get or create orchestrator for this session
+                q = _orchestrator_queues.get(session_id)
+                existing_task = _running_tasks.get(session_id)
+
+                if q and existing_task and not existing_task.done():
+                    # Orchestrator already running — feed message into its queue
+                    await q.put(user_content)
+                else:
+                    # Start new orchestrator
+                    q = asyncio.Queue()
+                    _orchestrator_queues[session_id] = q
+                    await q.put(user_content)
+
+                    async def _run_orch(sid, s, queue):
+                        try:
+                            await run_orchestrator(ws, sid, s, queue, _planning_queues)
+                        except asyncio.CancelledError:
+                            pass
+                        except Exception as e:
+                            tb_str = traceback.format_exc()
+                            print(f"Orchestrator error: {tb_str}")
+                            try:
+                                await ws.send_json(
+                                    {"type": "error", "session_id": sid, "message": str(e)}
+                                )
+                            except Exception:
+                                pass
+                        finally:
+                            _running_tasks.pop(sid, None)
+                            _orchestrator_queues.pop(sid, None)
+
+                    task_handle = asyncio.create_task(_run_orch(session_id, settings, q))
+                    _running_tasks[session_id] = task_handle
+                continue
+
+            # ── Cancel running task ──
+            if msg_type == "cancel":
+                sid = data.get("session_id", "")
+                task_handle = _running_tasks.pop(sid, None)
+                if task_handle:
+                    task_handle.cancel()
+                _planning_queues.pop(sid, None)
+                _orchestrator_queues.pop(sid, None)
+                await ws.send_json({
+                    "type": "cancelled",
+                    "session_id": sid,
+                })
+                continue
+
+            # Unknown message type
+            await ws.send_json({"type": "error", "message": f"Unknown message type: {msg_type}"})
 
     except WebSocketDisconnect:
         print("WebSocket client disconnected")

@@ -14,6 +14,23 @@ let recordingStartUrl = "";
 let onTabUpdatedListener = null;
 let onTabActivatedListener = null;
 
+// ── Screenshot capture ──
+
+async function captureScreenshot() {
+  try {
+    return await chrome.tabs.captureVisibleTab(null, { format: "jpeg", quality: 50 });
+  } catch {
+    return null;
+  }
+}
+
+function broadcastEventCount() {
+  chrome.runtime.sendMessage({
+    type: "RECORDING_EVENT_COUNT",
+    count: recordedEvents.length,
+  }).catch(() => {});
+}
+
 // ── Inject recorder into a single tab (best-effort) ──
 
 async function injectRecorder(tabId) {
@@ -54,14 +71,18 @@ async function startRecording() {
     if (!isRecording) return;
     if (changeInfo.status === "complete" && tab.url && !tab.url.startsWith("chrome://") && !tab.url.startsWith("chrome-extension://")) {
       await injectRecorder(tabId);
-      recordedEvents.push({
+      const screenshot = await captureScreenshot();
+      const event = {
         type: "navigation",
         timestamp: new Date().toISOString(),
         url: tab.url,
         page_title: tab.title || "",
         target: {},
         value: "",
-      });
+      };
+      if (screenshot) event.screenshot = screenshot;
+      recordedEvents.push(event);
+      broadcastEventCount();
     }
   };
   chrome.tabs.onUpdated.addListener(onTabUpdatedListener);
@@ -132,12 +153,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   if (msg.type === "RECORDER_EVENT") {
     if (isRecording) {
-      recordedEvents.push(msg.event);
-      // Broadcast event count to sidepanel
-      chrome.runtime.sendMessage({
-        type: "RECORDING_EVENT_COUNT",
-        count: recordedEvents.length,
-      }).catch(() => {});
+      const event = msg.event;
+      // Capture screenshot on key interaction events
+      const screenshotTypes = ["click", "submit", "select"];
+      if (screenshotTypes.includes(event.type)) {
+        captureScreenshot().then((dataUrl) => {
+          if (dataUrl) event.screenshot = dataUrl;
+          recordedEvents.push(event);
+          broadcastEventCount();
+        });
+      } else {
+        recordedEvents.push(event);
+        broadcastEventCount();
+      }
     }
+    return; // no async response needed
   }
 });

@@ -20,6 +20,11 @@
         </svg>
       </button>
       <span id="status-indicator" class="status disconnected" title="Disconnected"></span>
+      <button id="logs-btn" class="icon-btn" title="Server logs">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/>
+        </svg>
+      </button>
     </div>
     <div class="header-right">
       <!-- Model selector badge -->
@@ -68,6 +73,26 @@
     <div class="drawer-body" id="chats-list">
       <!-- Populated by JS -->
     </div>
+  </div>
+
+  <!-- ── Logs drawer ── -->
+  <div id="logs-drawer" class="drawer hidden">
+    <div class="drawer-header">
+      <span class="drawer-title">server logs</span>
+      <div class="logs-header-actions">
+        <button id="logs-clear" class="icon-btn" title="Clear">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4h6v2"/>
+          </svg>
+        </button>
+        <button id="logs-close" class="icon-btn" title="Close">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+          </svg>
+        </button>
+      </div>
+    </div>
+    <pre id="logs-output" class="logs-output"></pre>
   </div>
 
   <!-- ── Models manager overlay ── -->
@@ -179,42 +204,13 @@
     </div>
   </main>
 
-  <!-- ── Workflow review overlay ── -->
-  <div id="workflow-review" class="overlay hidden">
-    <div class="overlay-panel">
-      <div class="overlay-header">
-        <span class="overlay-title">review workflow</span>
-        <button id="review-close" class="icon-btn" title="Close">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
-          </svg>
-        </button>
-      </div>
-      <div class="overlay-body">
-        <div class="field">
-          <label for="wf-name">name</label>
-          <input id="wf-name" type="text" placeholder="my-workflow" spellcheck="false" />
-        </div>
-        <div class="field">
-          <label for="wf-description">description</label>
-          <input id="wf-description" type="text" placeholder="what this workflow does" spellcheck="false" />
-        </div>
-        <div id="wf-params" class="wf-params"></div>
-        <div class="field">
-          <label>steps</label>
-          <div id="wf-steps" class="wf-steps"></div>
-        </div>
-        <div id="wf-error" class="wf-error hidden"></div>
-        <div class="editor-actions">
-          <button id="review-discard" class="btn btn-ghost">discard</button>
-          <button id="review-save" class="btn btn-primary">save workflow</button>
-        </div>
-      </div>
-    </div>
-  </div>
-
   <!-- ── Input ── -->
   <footer id="input-area">
+    <div id="planning-bar" class="planning-bar hidden">
+      <button id="planning-approve" class="btn btn-primary btn-sm">approve</button>
+      <button id="planning-reject" class="btn btn-ghost btn-sm">reject</button>
+      <button id="planning-test" class="btn btn-ghost btn-sm">test</button>
+    </div>
     <div id="tab-context-badge" class="tab-context-badge hidden">
       <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
         <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/>
@@ -226,21 +222,27 @@
         </svg>
       </button>
     </div>
-    <div id="record-controls" class="record-controls">
-      <button id="record-btn" class="btn btn-record" title="Record a workflow">
-        <span class="record-dot"></span> record
-      </button>
-      <button id="stop-btn" class="btn btn-stop hidden" title="Stop recording">
-        <span class="stop-icon"></span> stop <span id="event-count" class="event-count">0</span>
+    <div id="recording-overlay" class="recording-overlay hidden">
+      <button id="overlay-stop-btn" class="btn btn-stop">
+        <span class="stop-icon"></span> stop recording <span id="overlay-event-count" class="event-count">0</span>
       </button>
     </div>
     <div class="input-wrapper">
-      <textarea id="message-input" placeholder="what should i do?" rows="1"></textarea>
-      <button id="send-btn" title="Send" disabled>
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-          <line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/>
+      <button id="workflow-picker-btn" class="icon-btn workflow-picker-btn" title="Run a workflow">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <polygon points="5 3 19 12 5 21 5 3"/>
         </svg>
       </button>
+      <textarea id="message-input" placeholder="what should i do?" rows="1"></textarea>
+      <button id="send-btn" title="Send" disabled>
+        <svg class="send-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/>
+        </svg>
+        <svg class="stop-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+          <rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor"/>
+        </svg>
+      </button>
+      <div id="workflow-picker-dropdown" class="workflow-picker-dropdown hidden"></div>
     </div>
   </footer>
 
