@@ -1141,7 +1141,6 @@ let lastProposedMarkdown = null;
 let mediaRecorder = null;
 let audioChunks = [];
 
-// Audio capture helpers
 async function startAudioCapture() {
   try {
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -1150,10 +1149,18 @@ async function startAudioCapture() {
     mediaRecorder.ondataavailable = (e) => {
       if (e.data.size > 0) audioChunks.push(e.data);
     };
-    mediaRecorder.start(1000); // collect chunks every 1s
-  } catch {
-    // No mic permission — continue without audio
+    mediaRecorder.start(1000);
+    return { ok: true };
+  } catch (err) {
     mediaRecorder = null;
+    const name = err?.name || "";
+    if (name === "NotAllowedError") {
+      return { ok: false, reason: "Microphone permission denied. On macOS: System Settings → Privacy & Security → Microphone → enable for Google Chrome, then restart Chrome." };
+    }
+    if (name === "NotFoundError") {
+      return { ok: false, reason: "No microphone found. Connect a mic and try again." };
+    }
+    return { ok: false, reason: `Mic error: ${err?.message || name}` };
   }
 }
 
@@ -1164,12 +1171,11 @@ function stopAudioCapture() {
       return;
     }
     mediaRecorder.onstop = () => {
-      // Stop all tracks on the stream
       mediaRecorder.stream.getTracks().forEach((t) => t.stop());
       if (audioChunks.length === 0) { resolve(""); return; }
       const blob = new Blob(audioChunks, { type: "audio/webm;codecs=opus" });
       const reader = new FileReader();
-      reader.onloadend = () => resolve(reader.result); // data:audio/webm;...base64,...
+      reader.onloadend = () => resolve(reader.result);
       reader.readAsDataURL(blob);
     };
     mediaRecorder.stop();
@@ -1185,9 +1191,15 @@ async function startRecordingFromOrchestrator() {
       if (overlayEventCount) overlayEventCount.textContent = "0";
       document.body.classList.add("recording-active");
       inputEl.disabled = true;
-      inputEl.placeholder = "recording... speak to narrate";
       sendBtn.disabled = true;
-      await startAudioCapture();
+
+      const mic = await startAudioCapture();
+      if (mic.ok) {
+        inputEl.placeholder = "recording... speak to narrate";
+      } else {
+        inputEl.placeholder = "recording... (no mic)";
+        addMessage("system", mic.reason);
+      }
     }
   });
 }
