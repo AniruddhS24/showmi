@@ -7,31 +7,27 @@ from db import LOGS_DIR, WORKFLOWS_DIR
 from workflow_utils import parse_frontmatter
 
 
-def load_workflows() -> str:
-    """Read all .md files from the workflows directory and return concatenated content.
+def load_workflows() -> list[dict]:
+    """Read all workflows and return structured data with text and image paths.
 
-    Parses YAML frontmatter to extract workflow name, description, and parameters.
-    Falls back gracefully for plain .md files without frontmatter.
+    Returns a list of dicts, each with:
+    - text: str — the workflow content formatted for the system prompt
+    - images: list[Path] — paths to screenshot files for multimodal injection
     """
-    if not WORKFLOWS_DIR.exists():
-        return ""
-    workflow_files = sorted(WORKFLOWS_DIR.glob("*.md"))
-    if not workflow_files:
-        return ""
-    parts = []
-    for f in workflow_files:
-        if f.name == "README.md":
-            continue
-        content = f.read_text().strip()
-        if not content:
-            continue
+    from workflow_utils import list_workflows
 
-        meta, body = parse_frontmatter(content)
-        name = meta.get("name", f.stem)
-        desc = meta.get("description", "")
-        params = meta.get("parameters", [])
+    workflows = list_workflows()
+    if not workflows:
+        return []
 
-        header = f"## Workflow: {name}"
+    results = []
+    for wf in workflows:
+        meta_name = wf.get("name", "untitled")
+        desc = wf.get("description", "")
+        params = wf.get("parameters", [])
+        body = wf.get("body", "")
+
+        header = f"## Workflow: {meta_name}"
         if desc:
             header += f"\n{desc}"
         if params:
@@ -44,9 +40,19 @@ def load_workflows() -> str:
                     f"{p.get('description', '')}{default_note}"
                 )
 
-        parts.append(f"{header}\n\n{body}")
-    if not parts:
+        text = f"{header}\n\n{body}"
+        image_paths = [Path(s) for s in wf.get("screenshot_paths", [])]
+        results.append({"text": text, "images": image_paths})
+
+    return results
+
+
+def load_workflows_text() -> str:
+    """Load workflows as a single text string (for non-multimodal contexts)."""
+    workflows = load_workflows()
+    if not workflows:
         return ""
+    parts = [wf["text"] for wf in workflows]
     return "# Available Workflows\n\n" + "\n\n---\n\n".join(parts)
 
 

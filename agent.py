@@ -2,9 +2,9 @@ from browser_use import Agent, Browser
 from browser_use.browser.profile import BrowserProfile
 from browser_use.llm.openai.chat import ChatOpenAI
 
-from config import config
+from config import _parse_use_vision, config
 from db import get_identity_text, get_memory_text
-from hooks import load_workflows, on_step_end, on_step_start
+from hooks import load_workflows_text, on_step_end, on_step_start
 
 
 def _make_browser(cfg=None) -> Browser:
@@ -31,7 +31,7 @@ def _build_system_message() -> str | None:
     memory = get_memory_text()
     if memory:
         parts.append(memory)
-    workflows = load_workflows()
+    workflows = load_workflows_text()
     if workflows:
         parts.append(workflows)
     return "\n\n---\n\n".join(parts) if parts else None
@@ -63,7 +63,11 @@ async def run_agent(task: str) -> None:
         extend_system_message=system_message,
         max_actions_per_step=config.max_actions_per_step,
         max_failures=config.max_failures,
-        use_vision=config.use_vision,
+        use_vision=_parse_use_vision(config.use_vision),
+        flash_mode=config.flash_mode,
+        use_thinking=config.use_thinking,
+        vision_detail_level=config.vision_detail_level,
+        max_history_items=config.max_history_items or None,
     )
 
     print("Running agent...\n")

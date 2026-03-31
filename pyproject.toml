@@ -12,10 +12,11 @@ dependencies = [
     "uvicorn[standard]",
     "websockets",
     "pyyaml>=6.0",
+    "playwright>=1.40.0",
 ]
 
 [tool.setuptools]
-py-modules = ["main", "agent", "config", "hooks", "db", "server", "workflow_utils"]
+py-modules = ["main", "agent", "config", "hooks", "db", "server", "workflow_utils", "planning", "orchestrator", "workflow_runner"]
 
 [project.scripts]
 showmi = "main:cli"

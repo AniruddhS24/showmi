@@ -39,6 +39,71 @@ if (!window.__showmi_recorder) {
     };
   }
 
+  function describeElementCompact(el) {
+    if (!el || !el.tagName) return "";
+    const tag = el.tagName.toLowerCase();
+    const attrs = [];
+    if (el.id) attrs.push(`id="${el.id}"`);
+    if (el.className && typeof el.className === "string") {
+      const cls = el.className.trim();
+      if (cls) attrs.push(`class="${cls.split(/\s+/).slice(0, 3).join(" ")}"`);
+    }
+    for (const a of ["aria-label", "role", "placeholder", "type", "name", "href"]) {
+      const v = el.getAttribute(a);
+      if (v) attrs.push(`${a}="${v.slice(0, 60)}"`);
+    }
+    const text = (el.innerText || "").slice(0, 80).trim().replace(/\n+/g, " ");
+    const attrStr = attrs.length ? " " + attrs.join(" ") : "";
+    return text ? `<${tag}${attrStr}>${text}</${tag}>` : `<${tag}${attrStr}>`;
+  }
+
+  function captureLocalDOM(el, maxElements = 40) {
+    const seen = new Set();
+    const collected = [];
+
+    function addEl(node, priority) {
+      if (!node || !node.tagName || seen.has(node) || node === document.documentElement || node === document.body) return;
+      seen.add(node);
+      const desc = describeElementCompact(node);
+      if (desc) collected.push({ desc, priority });
+    }
+
+    // The interacted element (highest priority)
+    addEl(el, 0);
+
+    // Parent chain (up to 3 levels)
+    let parent = el?.parentElement;
+    for (let i = 1; i <= 3 && parent && parent !== document.body; i++) {
+      addEl(parent, i);
+      // Siblings at this level
+      if (parent.parentElement) {
+        for (const sibling of parent.parentElement.children) {
+          addEl(sibling, i + 1);
+        }
+      }
+      parent = parent.parentElement;
+    }
+
+    // Siblings of the target
+    if (el?.parentElement) {
+      for (const sibling of el.parentElement.children) {
+        addEl(sibling, 1);
+      }
+    }
+
+    // Nearby landmarks
+    const landmarks = document.querySelectorAll(
+      "[role], [aria-label], header, nav, main, footer, form, h1, h2, h3"
+    );
+    for (const lm of landmarks) {
+      addEl(lm, 5);
+    }
+
+    // Sort by priority (closer = lower number = first), cap at max
+    collected.sort((a, b) => a.priority - b.priority);
+    return collected.slice(0, maxElements).map((c) => "  " + c.desc).join("\n");
+  }
+
   function sendEvent(evt) {
     try {
       chrome.runtime.sendMessage({ type: "RECORDER_EVENT", event: evt });
@@ -66,6 +131,7 @@ if (!window.__showmi_recorder) {
       page_title: document.title,
       target: describeElement(el),
       value: "",
+      dom_context: captureLocalDOM(el),
     });
   }, true);
 
@@ -95,6 +161,7 @@ if (!window.__showmi_recorder) {
       page_title: document.title,
       target: describeElement(el),
       value: el.value,
+      dom_context: captureLocalDOM(el),
     };
 
     pendingInputs.set(el, evt);
@@ -117,6 +184,7 @@ if (!window.__showmi_recorder) {
         page_title: document.title,
         target: describeElement(el),
         value: el.type === "checkbox" ? String(el.checked) : el.value,
+        dom_context: captureLocalDOM(el),
       });
     }
   }, true);
@@ -131,6 +199,7 @@ if (!window.__showmi_recorder) {
       page_title: document.title,
       target: describeElement(e.target),
       value: e.key,
+      dom_context: captureLocalDOM(e.target),
     });
   }, true);
 
@@ -155,6 +224,7 @@ if (!window.__showmi_recorder) {
         selector: buildSelector(form),
       },
       value: "",
+      dom_context: captureLocalDOM(form),
     });
   }, true);
 
