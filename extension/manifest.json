@@ -22,5 +22,9 @@
   },
   "action": {
     "default_title": "Open Showmi"
-  }
+  },
+  "web_accessible_resources": [{
+    "resources": ["mic-permission.html", "mic-permission.js"],
+    "matches": ["<all_urls>"]
+  }]
 }

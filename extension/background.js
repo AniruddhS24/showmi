@@ -151,6 +151,61 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true; // async response
   }
 
+  if (msg.type === "REQUEST_MIC_PERMISSION") {
+    (async () => {
+      try {
+        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        if (!tab || !tab.url || tab.url.startsWith("chrome://") || tab.url.startsWith("chrome-extension://")) {
+          sendResponse({ granted: false, error: "NoSuitableTab" });
+          return;
+        }
+
+        const iframeUrl = chrome.runtime.getURL("mic-permission.html");
+
+        await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          func: (url) => {
+            if (document.getElementById("__showmi_mic_iframe")) return;
+            const iframe = document.createElement("iframe");
+            iframe.id = "__showmi_mic_iframe";
+            iframe.src = url;
+            iframe.allow = "microphone";
+            iframe.style.cssText = "display:none;width:0;height:0;border:none;position:fixed;top:-9999px;";
+            document.body.appendChild(iframe);
+          },
+          args: [iframeUrl],
+        });
+
+        const result = await new Promise((resolve) => {
+          const timeout = setTimeout(() => resolve({ granted: false, error: "Timeout" }), 30000);
+          const listener = (message) => {
+            if (message.type === "MIC_PERMISSION_RESULT") {
+              clearTimeout(timeout);
+              chrome.runtime.onMessage.removeListener(listener);
+              resolve(message);
+            }
+          };
+          chrome.runtime.onMessage.addListener(listener);
+        });
+
+        try {
+          await chrome.scripting.executeScript({
+            target: { tabId: tab.id },
+            func: () => {
+              const el = document.getElementById("__showmi_mic_iframe");
+              if (el) el.remove();
+            },
+          });
+        } catch { /* tab may have navigated */ }
+
+        sendResponse(result);
+      } catch (err) {
+        sendResponse({ granted: false, error: err?.message || "Unknown" });
+      }
+    })();
+    return true;
+  }
+
   if (msg.type === "RECORDER_EVENT") {
     if (isRecording) {
       const event = msg.event;

@@ -315,7 +315,7 @@ async def _curate_events_openai(
 
     response = await client.chat.completions.create(
         model=model,
-        max_tokens=1024,
+        max_completion_tokens=1024,
         response_format={"type": "json_object"},
         messages=[
             {"role": "system", "content": CURATE_SYSTEM_PROMPT},
@@ -534,7 +534,7 @@ async def _run_openai_planning(
     while True:
         response = await client.chat.completions.create(
             model=model,
-            max_tokens=8192,
+            max_completion_tokens=8192,
             tools=OPENAI_TOOLS,
             messages=openai_messages,
         )
@@ -656,14 +656,32 @@ async def run_planning_agent(
     where the agent writes a hybrid Playwright script for the workflow.
     """
     try:
-        audio_transcript = await transcribe_audio(
-            recording.get("audio_b64", ""), settings
-        )
+        audio_b64 = recording.get("audio_b64", "")
+        audio_transcript = ""
+        if audio_b64:
+            await _safe_send(ws, {
+                "type": "planning_message",
+                "session_id": session_id,
+                "content": "Transcribing audio narration...",
+            })
+            audio_transcript = await transcribe_audio(audio_b64, settings)
+            if audio_transcript:
+                await _safe_send(ws, {
+                    "type": "planning_message",
+                    "session_id": session_id,
+                    "content": f"**Narration transcript:** {audio_transcript}",
+                })
+            else:
+                await _safe_send(ws, {
+                    "type": "planning_message",
+                    "session_id": session_id,
+                    "content": "Could not transcribe audio.",
+                })
 
         raw_events = recording.get("events", [])
         filtered_events = _prefilter_events(raw_events)
 
-        await _safe_send(ws,{
+        await _safe_send(ws, {
             "type": "planning_message",
             "session_id": session_id,
             "content": f"Analyzing {len(raw_events)} recorded events...",

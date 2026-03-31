@@ -1141,26 +1141,42 @@ let lastProposedMarkdown = null;
 let mediaRecorder = null;
 let audioChunks = [];
 
+function _initRecorder(stream) {
+  audioChunks = [];
+  mediaRecorder = new MediaRecorder(stream, { mimeType: "audio/webm;codecs=opus" });
+  mediaRecorder.ondataavailable = (e) => {
+    if (e.data.size > 0) audioChunks.push(e.data);
+  };
+  mediaRecorder.start(1000);
+  return { ok: true };
+}
+
 async function startAudioCapture() {
   try {
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    audioChunks = [];
-    mediaRecorder = new MediaRecorder(stream, { mimeType: "audio/webm;codecs=opus" });
-    mediaRecorder.ondataavailable = (e) => {
-      if (e.data.size > 0) audioChunks.push(e.data);
-    };
-    mediaRecorder.start(1000);
-    return { ok: true };
+    return _initRecorder(stream);
   } catch (err) {
-    mediaRecorder = null;
-    const name = err?.name || "";
-    if (name === "NotAllowedError") {
-      return { ok: false, reason: "Microphone permission denied. On macOS: System Settings → Privacy & Security → Microphone → enable for Google Chrome, then restart Chrome." };
+    if (err?.name === "NotAllowedError") {
+      // Sidepanel can't trigger the permission prompt — use iframe workaround
+      const result = await new Promise((resolve) => {
+        chrome.runtime.sendMessage({ type: "REQUEST_MIC_PERMISSION" }, resolve);
+      });
+      if (result?.granted) {
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          return _initRecorder(stream);
+        } catch (retryErr) {
+          mediaRecorder = null;
+          return { ok: false, reason: `Mic error after permission grant: ${retryErr?.message || retryErr?.name}` };
+        }
+      }
+      return { ok: false, reason: "Microphone permission denied. Please allow mic access when prompted and try again." };
     }
-    if (name === "NotFoundError") {
+    mediaRecorder = null;
+    if (err?.name === "NotFoundError") {
       return { ok: false, reason: "No microphone found. Connect a mic and try again." };
     }
-    return { ok: false, reason: `Mic error: ${err?.message || name}` };
+    return { ok: false, reason: `Mic error: ${err?.message || err?.name}` };
   }
 }
 
@@ -1376,18 +1392,62 @@ function renderScriptProposal(manifestYaml, scriptCode) {
 
 // Planning action buttons
 if (planningApprove) {
-  planningApprove.addEventListener("click", () => {
+  planningApprove.addEventListener("click", async () => {
+    if (!lastProposedMarkdown) return;
+    planningApprove.disabled = true;
+    planningApprove.textContent = "saving...";
+
+    // Build file_content with YAML frontmatter
+    let fileContent = lastProposedMarkdown;
+    if (lastProposedManifest) {
+      // manifest is already YAML — wrap it as frontmatter
+      const yaml = lastProposedManifest.trim();
+      fileContent = `---\n${yaml}\n---\n\n${lastProposedMarkdown.trim()}\n`;
+    }
+
+    try {
+      const res = await fetch(`${API_BASE}/api/workflows`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ file_content: fileContent }),
+      });
+      const result = await res.json();
+      if (res.ok && result.ok) {
+        addMessage("system", `Workflow saved: ${result.id}`);
+        exitPlanningMode();
+      } else if (res.status === 409) {
+        // Already exists — update instead
+        const name = fileContent.match(/name:\s*(.+)/)?.[1]?.trim() || "workflow";
+        const slug = name.toLowerCase().replace(/[^\w\s-]/g, "").replace(/[\s_]+/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "");
+        const updateRes = await fetch(`${API_BASE}/api/workflows/${slug}`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ file_content: fileContent }),
+        });
+        const updateResult = await updateRes.json();
+        if (updateRes.ok && updateResult.ok) {
+          addMessage("system", `Workflow updated: ${updateResult.id}`);
+          exitPlanningMode();
+        } else {
+          addMessage("error", updateResult.error || "Failed to save workflow.");
+        }
+      } else {
+        addMessage("error", result.error || "Failed to save workflow.");
+      }
+    } catch (err) {
+      addMessage("error", `Save failed: ${err.message}`);
+    }
+
+    planningApprove.disabled = false;
+    planningApprove.textContent = "approve";
+
+    // Signal planning agent to stop (best-effort)
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({
         type: "planning_action",
         session_id: currentSessionId,
         action: "approve",
-        manifest_yaml: lastProposedManifest,
-        script_code: lastProposedScript,
-        workflow_markdown: lastProposedMarkdown,
       }));
-      planningApprove.disabled = true;
-      planningApprove.textContent = "saving...";
     }
   });
 }

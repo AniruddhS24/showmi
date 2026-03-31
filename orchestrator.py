@@ -597,7 +597,7 @@ async def _run_orchestrator_openai(
     while True:
         response = await client.chat.completions.create(
             model=model,
-            max_tokens=2048,
+            max_completion_tokens=2048,
             tools=OPENAI_TOOLS,
             messages=openai_messages,
         )
