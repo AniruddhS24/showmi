@@ -33,8 +33,8 @@ class Config:
     require_confirmation: bool = os.getenv("REQUIRE_CONFIRMATION", "false").lower() == "true"
 
     # Speed tuning
-    flash_mode: bool = os.getenv("FLASH_MODE", "false").lower() == "true"
-    use_thinking: bool = os.getenv("USE_THINKING", "true").lower() == "true"
+    flash_mode: bool = os.getenv("FLASH_MODE", "true").lower() == "true"
+    use_thinking: bool = os.getenv("USE_THINKING", "false").lower() == "true"
     vision_detail_level: str = os.getenv("VISION_DETAIL_LEVEL", "auto")  # "auto", "low", "high"
     max_history_items: int = int(os.getenv("MAX_HISTORY_ITEMS", "0"))  # 0 = unlimited
 

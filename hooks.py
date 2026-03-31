@@ -1,59 +1,8 @@
 import json
 from datetime import datetime, timezone
-from pathlib import Path
 
 from config import config
-from db import LOGS_DIR, WORKFLOWS_DIR
-from workflow_utils import parse_frontmatter
-
-
-def load_workflows() -> list[dict]:
-    """Read all workflows and return structured data with text and image paths.
-
-    Returns a list of dicts, each with:
-    - text: str — the workflow content formatted for the system prompt
-    - images: list[Path] — paths to screenshot files for multimodal injection
-    """
-    from workflow_utils import list_workflows
-
-    workflows = list_workflows()
-    if not workflows:
-        return []
-
-    results = []
-    for wf in workflows:
-        meta_name = wf.get("name", "untitled")
-        desc = wf.get("description", "")
-        params = wf.get("parameters", [])
-        body = wf.get("body", "")
-
-        header = f"## Workflow: {meta_name}"
-        if desc:
-            header += f"\n{desc}"
-        if params:
-            header += "\n\nParameters:"
-            for p in params:
-                default = p.get("default", "")
-                default_note = f" (default: {default})" if default else ""
-                header += (
-                    f"\n- {{{{{p['name']}}}}}: "
-                    f"{p.get('description', '')}{default_note}"
-                )
-
-        text = f"{header}\n\n{body}"
-        image_paths = [Path(s) for s in wf.get("screenshot_paths", [])]
-        results.append({"text": text, "images": image_paths})
-
-    return results
-
-
-def load_workflows_text() -> str:
-    """Load workflows as a single text string (for non-multimodal contexts)."""
-    workflows = load_workflows()
-    if not workflows:
-        return ""
-    parts = [wf["text"] for wf in workflows]
-    return "# Available Workflows\n\n" + "\n\n---\n\n".join(parts)
+from db import LOGS_DIR
 
 
 async def on_step_start(agent) -> None:

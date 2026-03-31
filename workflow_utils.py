@@ -1,4 +1,4 @@
-"""Utilities for workflow file I/O, frontmatter parsing, and LLM-based compilation."""
+"""Utilities for workflow file I/O and frontmatter parsing."""
 
 import base64
 import io
@@ -8,115 +8,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
-from browser_use.llm.anthropic.chat import ChatAnthropic as BrowserUseChatAnthropic
-from browser_use.llm.openai.chat import ChatOpenAI as BrowserUseChatOpenAI
-from browser_use.llm.messages import SystemMessage, UserMessage
 from PIL import Image
 
 from db import WORKFLOWS_DIR
 
-
-
-COMPILE_SYSTEM_PROMPT = """\
-You are a workflow compiler for a browser automation agent powered by browser-use. You receive \
-a raw recorded browser demonstration (DOM events with surrounding HTML context, screenshots, \
-and optional audio narration) and must produce a clean, reusable workflow document.
-
-CRITICAL: The raw recording may have 20-50+ low-level events. You must COMPRESS these into \
-5-12 meaningful high-level steps. Merge related events aggressively:
-- click on input + typing → single "input_text" step
-- click on button → single "click_element" step
-- navigation + page load → single "go_to_url" step
-- scrolling → omit unless critical to the workflow
-- redundant clicks (e.g., click then re-click) → single step
-Select only the steps that are ESSENTIAL to reproduce the workflow. A good workflow \
-has 5-12 steps, not 20+.
-
-## browser-use actions
-
-Use ONLY these action names (these are the actual actions the agent can perform):
-- go_to_url: Navigate to a URL
-- click_element: Click an element (describe by visible text, aria-label, or role)
-- input_text: Type text into a form field
-- send_keys: Press keyboard keys (e.g., "Enter", "Tab Tab Enter", "Escape", "ArrowDown")
-- select_dropdown_option: Select from a dropdown menu
-- scroll_down / scroll_up: Scroll the page
-- scroll_to_text: Scroll until specific text is visible
-- extract_page_content: Extract text or data from the page
-- go_back: Navigate back
-- wait: Wait for a condition
-
-Your output must be a single markdown document with YAML frontmatter in EXACTLY this format:
-
-```
----
-name: <workflow_name>
-description: <1-2 sentence description of what this workflow accomplishes>
-parameters:
-  - name: <param_name>
-    description: <what this parameter is>
-    default: "<optional default value>"
----
-
-## Description
-
-<2-3 sentences explaining the full workflow: what site it operates on, what it accomplishes, \
-and when/why you'd use it.>
-
-## Guidelines
-
-- <Rule or tip for executing this workflow successfully>
-- <Edge case to watch out for>
-- <Timing/waiting notes if relevant>
-
-## Steps
-
-Follow these steps to complete "{{name}}":
-
-### Step 1
-go_to_url: <starting URL with {{param}} placeholders>
-
-### Step 2
-![screenshot](step-2.jpg)
-click_element: Click "<element described by visible text, aria-label, or role>"
-Fallback: send_keys "Tab Tab Enter" to reach and activate the element
-
-### Step 3
-![screenshot](step-3.jpg)
-input_text: Type "{{param}}" into "<element described by placeholder or label>"
-Fallback: Click the field first, then type
-
-...
-
-## Error Recovery
-
-- If an element is not visible, use scroll_down to find it
-- If a click fails, use send_keys with Tab navigation as fallback
-- If a page doesn't load, use go_to_url to retry from the last known URL
-- <Any workflow-specific recovery steps>
-
-This marks the end of the workflow.
-```
-
-Rules:
-- COMPRESS raw events into 5-12 high-level steps. Each step = one meaningful user action.
-- Step 1 must ALWAYS be go_to_url with the starting URL.
-- Name actions using the exact browser-use action names listed above.
-- Describe elements using visible text, aria-label, role, or placeholder \
-— NEVER use CSS selectors or element IDs.
-- Use the DOM context provided with each event to write accurate element descriptions.
-- Include a Fallback line for steps that involve clicking or interacting with specific elements.
-- The screenshot reference ![screenshot](step-N.jpg) will be resolved to actual images later.
-- If audio narration is provided, use it to understand user intent, add context to the \
-Description section, and inform the Guidelines.
-- The Guidelines section should capture edge cases, timing, error-prone steps, or \
-prerequisites the user mentioned.
-- Output ONLY the markdown document, no extra commentary.
-- Detect values that look like user-specific data (names, dates, cities, URLs, amounts, \
-search queries, etc.) and replace them with {{parameter_name}} placeholders.
-- List every parameter you introduce in the YAML frontmatter `parameters` array.
-- Use descriptive snake_case names for parameters.
-"""
 
 
 # ── Frontmatter parsing ──
@@ -402,27 +297,6 @@ def delete_workflow(workflow_id: str) -> bool:
     return False
 
 
-# ── LLM compilation ──
-
-
-def _make_llm(settings: dict):
-    """Build an LLM client from settings dict (same pattern as run_agent_ws)."""
-    provider = settings.get("provider", "local")
-    if provider == "anthropic":
-        return BrowserUseChatAnthropic(
-            model=settings.get("model", ""),
-            temperature=float(settings.get("temperature", 0.5)),
-            api_key=settings.get("api_key", ""),
-        )
-    else:
-        return BrowserUseChatOpenAI(
-            base_url=settings.get("base_url", ""),
-            model=settings.get("model", ""),
-            temperature=float(settings.get("temperature", 0.5)),
-            api_key=settings.get("api_key", "not-needed"),
-        )
-
-
 def _screenshot_thumbnail(data_url: str, size: tuple[int, int] = (64, 64)) -> list[int] | None:
     """Decode a data-URL screenshot into a flat list of grayscale pixel values."""
     try:
@@ -595,66 +469,5 @@ def _format_recording_for_llm(recording: dict, audio_transcript: str = "") -> st
 
     return "\n".join(parts)
 
-
-async def compile_recording(
-    recording: dict,
-    name: str,
-    description: str,
-    auto_parameterize: bool,
-    llm_settings: dict,
-    audio_transcript: str = "",
-) -> dict:
-    """Call the LLM to compile raw DOM events into a semantic workflow.
-
-    Returns a dict with: name, description, parameters, body, file_content.
-    Raises ValueError if the LLM output cannot be parsed.
-    """
-    system = COMPILE_SYSTEM_PROMPT
-
-    # Pre-filter events for the one-shot compile path
-    filtered_recording = {**recording, "events": _prefilter_events(recording.get("events", []))}
-    formatted = _format_recording_for_llm(filtered_recording, audio_transcript)
-    user_msg = f"{formatted}\n\nThe user named this workflow: \"{name}\"\n"
-    if description:
-        user_msg += f"Description: {description}\n"
-
-    llm = _make_llm(llm_settings)
-    messages = [
-        SystemMessage(content=system),
-        UserMessage(content=user_msg),
-    ]
-    response = await llm.ainvoke(messages)
-    raw_output = response.completion if hasattr(response, "completion") else str(response)
-
-    # Strip markdown code fences if the LLM wrapped the output
-    cleaned = raw_output.strip()
-    if cleaned.startswith("```"):
-        first_newline = cleaned.index("\n")
-        cleaned = cleaned[first_newline + 1 :]
-    if cleaned.endswith("```"):
-        cleaned = cleaned[: -len("```")]
-    cleaned = cleaned.strip()
-
-    meta, body = parse_frontmatter(cleaned)
-    if not meta:
-        raise ValueError(raw_output)
-
-    # Ensure required fields
-    meta.setdefault("name", name)
-    meta.setdefault("description", description)
-    meta.setdefault("parameters", [])
-    now = datetime.now(timezone.utc).isoformat()
-    meta.setdefault("created_at", now)
-    meta.setdefault("updated_at", now)
-
-    file_content = render_frontmatter(meta, body)
-
-    return {
-        "name": meta["name"],
-        "description": meta["description"],
-        "parameters": meta["parameters"],
-        "body": body,
-        "file_content": file_content,
-    }
 
 

@@ -23,51 +23,56 @@ ORCHESTRATOR_SYSTEM_PROMPT = """\
 You are an orchestrator for a browser automation assistant called Showmi. The user \
 talks to you naturally and you decide what to do.
 
-You have eight tools:
+## Tools
 
-1. **run_browser_agent** — Execute a browser automation task. Use this when the user \
-wants something DONE in their browser (navigate, click, fill forms, extract data, etc.). \
-Pass a clear, detailed task description. Optionally pass 'context' with relevant memories.
+1. **run_browser_agent** — Execute a browser automation task. Pass a clear, detailed task \
+description. Always pass retrieved memories as 'context'.
 
-2. **run_workflow** — Run a saved workflow by name or ID. The workflow file will be loaded \
-and passed to the browser agent as detailed instructions. If the workflow has parameters \
-(like {{destination}}), ask the user for values first.
+2. **run_workflow** — Run a saved workflow by name or ID. Ask the user for any required \
+parameter values before running.
 
-3. **search_workflows** — Search or list all saved workflows. Use this when the user asks \
-about available workflows, or when you want to check if a matching workflow already exists \
-before running a browser task from scratch.
+3. **list_workflows** — List all saved workflows with their IDs, names, descriptions, and \
+parameters. Call this before run_browser_agent. If any listed workflow covers what the user \
+asked for, use run_workflow with that ID — never run a task from scratch when a saved \
+workflow already handles it.
 
-4. **query_memories** — Search stored memories for context relevant to a task. Call this \
-before run_browser_agent when the task involves a site or workflow the user has used before. \
-Pass the result as 'context' to run_browser_agent. Also call this when the user asks what \
-you remember about something.
+4. **query_memories** — Search stored memories. Call this BEFORE every browser task, no \
+exceptions. Pass the results as 'context' to run_browser_agent or run_workflow. Also call \
+this when the user asks what you remember about something.
 
-5. **store_memory** — Persist a correction, preference, or lesson learned as a memory. \
-Call this when: the user corrects you, states a persistent preference, or after a browser \
-run reveals a non-obvious site trick worth remembering. \
-Use type='procedural' + priority=1 for corrections. Use type='semantic' for preferences. \
-Use type='episodic' for a one-sentence summary of what a browser run did and how.
+5. **store_memory** — Persist information across sessions. Three uses:
+   - After EVERY completed browser run: store an episodic summary (type='episodic') — \
+one sentence describing what was done, on which site, and the outcome.
+   - After discovering a site-specific trick or navigation pattern: store it as \
+type='procedural'. Use priority=1 if the user explicitly corrected you.
+   - When the user states a preference or fact about themselves: store as type='semantic'.
 
 6. **start_recording** — Ask the user to demonstrate a workflow by recording their browser \
-actions. Use when the user wants to TEACH you something new.
+actions. Use when the user wants to teach you something new.
 
 7. **start_planning** — Process a recorded demonstration into a reusable workflow. \
-Call this IMMEDIATELY after receiving recording data from start_recording.
+Call this IMMEDIATELY after start_recording returns.
 
 8. **save_as_workflow** — Save the current session's browser actions as a reusable workflow.
 
-Guidelines:
-- Before running a browser task on a specific site → query_memories first, then pass results as context
-- After a browser run that revealed something non-obvious → store_memory with what was learned
-- For direct browser tasks → run_browser_agent
-- To find a matching workflow → search_workflows, then run_workflow with the ID
-- For questions or conversation → respond directly (no tool call)
-- Always briefly acknowledge what you're about to do before calling a tool
-- After a sub-agent finishes, summarize the result for the user
-- If the user's intent is ambiguous, ask a clarifying question before acting
-- When the user corrects you or states a persistent preference, call store_memory BEFORE \
-acknowledging. Do not ask for confirmation — just store it and confirm.
-{context}\
+## Memory Rules (follow these strictly)
+
+BEFORE any browser task:
+  1. query_memories with keywords from the task (site name, action type, topic)
+  2. Pass results as 'context' to run_browser_agent or run_workflow
+
+AFTER any completed browser run:
+  1. store_memory with type='episodic': one sentence — what was done, where, result
+  2. If a non-obvious site trick was discovered: also store type='procedural'
+
+IMMEDIATELY when the user corrects you or states a preference:
+  - store_memory before replying. Do not ask for confirmation.
+
+## Other Guidelines
+
+- Always call list_workflows before run_browser_agent. Read the results and use run_workflow if any workflow matches — do not run from scratch.
+- If the user's intent is ambiguous, ask before acting
+- Keep your messages brief — the user can see what the agent is doing\
 """
 
 # ── Tool definitions ──
@@ -87,13 +92,18 @@ ANTHROPIC_TOOLS = [
                     "type": "string",
                     "description": "Optional context to inject into the agent's system prompt, e.g. relevant memories retrieved via query_memories.",
                 },
+                "flash_mode": {
+                    "type": "boolean",
+                    "description": "Use fast/cheap mode. Set true for simple, predictable tasks (single-page lookups, form fills, navigation). Set false for complex tasks requiring reasoning across multiple pages or dynamic decision-making.",
+                    "default": True,
+                },
             },
             "required": ["task"],
         },
     },
     {
         "name": "run_workflow",
-        "description": "Run a saved workflow by name or ID. Loads the workflow file and passes it to the browser agent as instructions.",
+        "description": "Run a saved workflow by name or ID. Loads the workflow file and passes it to the browser agent as instructions. Query memories first and pass results as context.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -105,6 +115,16 @@ ANTHROPIC_TOOLS = [
                     "type": "string",
                     "description": "Additional context or parameter values for this run (e.g., 'destination=NYC, date=2024-04-15')",
                     "default": "",
+                },
+                "context": {
+                    "type": "string",
+                    "description": "Relevant memories retrieved via query_memories to inject as context.",
+                    "default": "",
+                },
+                "flash_mode": {
+                    "type": "boolean",
+                    "description": "Use fast/cheap mode. Set true for simple, predictable workflows. Set false for complex multi-step workflows requiring dynamic reasoning.",
+                    "default": True,
                 },
             },
             "required": ["workflow_id"],
@@ -133,17 +153,11 @@ ANTHROPIC_TOOLS = [
         },
     },
     {
-        "name": "search_workflows",
-        "description": "Search or list all saved workflows. Returns workflow IDs, names, descriptions, and parameters. Use to find a workflow that matches the user's request before calling run_workflow.",
+        "name": "list_workflows",
+        "description": "List all saved workflows with their IDs, names, descriptions, and parameters. Call this before run_browser_agent to check if a saved workflow already covers the task.",
         "input_schema": {
             "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Optional search term to filter workflows by name or description. Leave empty to list all.",
-                    "default": "",
-                },
-            },
+            "properties": {},
         },
     },
     {
@@ -264,19 +278,21 @@ async def _execute_run_browser_agent(
     """Execute the browser agent and return a result summary."""
     from server import run_agent_ws
 
+    if context:
+        task = f"Context from memory:\n{context}\n\n---\n\n{task}"
+
     try:
         result = await run_agent_ws(
             task, ws, session_id, settings,
-            context=context,
             agent_overrides=agent_overrides,
         )
         summary = result or "Browser agent completed (no result text)."
         return (
             f"{summary}\n\n"
             "---\n"
-            "If this run revealed a non-obvious site trick or navigation approach worth "
-            "remembering for future runs, call store_memory now (type='procedural' or "
-            "'episodic'). Skip if the run was routine."
+            "Now call store_memory with type='episodic': one sentence summarizing what was "
+            "done, on which site, and the outcome. If a non-obvious site trick was discovered, "
+            "also call store_memory with type='procedural'."
         )
     except Exception as e:
         return f"Browser agent failed: {e}"
@@ -328,44 +344,27 @@ def _format_workflow_task(workflow: dict, task_context: str) -> str:
     return "\n".join(lines)
 
 
-# Workflow execution uses speed-optimized agent settings (DOM-only, no screenshots)
-_WORKFLOW_AGENT_OVERRIDES = {
-    "flash_mode": True,
-    "use_thinking": False,
-    "use_vision": "auto",
-}
-
 async def _execute_run_workflow(
     workflow_id: str,
     task_context: str,
     ws: WebSocket,
     session_id: str,
     settings: dict,
+    context: str | None = None,
+    flash_mode: bool = True,
 ) -> str:
-    """Load a workflow and run it. Uses Playwright runner for new format, browser-use for legacy."""
+    """Load a workflow and run it via browser-use agent."""
     from workflow_utils import get_workflow
 
     workflow = get_workflow(workflow_id)
     if not workflow:
         return f"Workflow '{workflow_id}' not found."
 
-    # For playwright-format workflows, load the markdown file for browser-use
-    if workflow.get("format") == "playwright":
-        from db import WORKFLOWS_DIR
-
-        md_path = WORKFLOWS_DIR / workflow_id / "workflow.md"
-        if md_path.exists():
-            workflow = {
-                "file_content": md_path.read_text(),
-                "parameters": workflow.get("parameters", []),
-            }
-        else:
-            return f"Workflow '{workflow_id}' has no markdown file."
-
-    # All workflows run via browser-use agent with DOM (no screenshots)
     task = _format_workflow_task(workflow, task_context)
     return await _execute_run_browser_agent(
-        task, ws, session_id, settings, agent_overrides=_WORKFLOW_AGENT_OVERRIDES
+        task, ws, session_id, settings,
+        context=context or None,
+        agent_overrides={"flash_mode": flash_mode, "use_thinking": False, "use_vision": "auto"},
     )
 
 
@@ -436,23 +435,13 @@ def _execute_store_memory(type: str, content: str, priority: int = 0) -> str:
         return f"Failed to store memory: {e}"
 
 
-def _execute_search_workflows(query: str = "") -> str:
-    """Search or list all saved workflows."""
+def _execute_list_workflows() -> str:
+    """List all saved workflows."""
     from workflow_utils import list_workflows
 
     wf_list = list_workflows()
     if not wf_list:
         return "No workflows saved yet."
-
-    if query:
-        q = query.lower()
-        wf_list = [
-            wf for wf in wf_list
-            if q in wf.get("name", "").lower() or q in wf.get("description", "").lower()
-        ]
-
-    if not wf_list:
-        return f"No workflows matching '{query}'."
 
     lines = []
     for wf in wf_list:
@@ -461,7 +450,7 @@ def _execute_search_workflows(query: str = "") -> str:
             f'- id="{wf["id"]}", name="{wf.get("name", wf["id"])}", '
             f'description="{wf.get("description", "")}", params=[{params}]'
         )
-    return "Available workflows:\n" + "\n".join(lines)
+    return "Saved workflows:\n" + "\n".join(lines)
 
 
 async def _execute_save_as_workflow(
@@ -601,8 +590,10 @@ async def _run_orchestrator_anthropic(
                 if tool_name == "run_browser_agent":
                     task = tool_input.get("task", "")
                     context = tool_input.get("context") or None
+                    flash = tool_input.get("flash_mode", True)
                     result_text = await _execute_run_browser_agent(
-                        task, ws, session_id, settings, context=context
+                        task, ws, session_id, settings, context=context,
+                        agent_overrides={"flash_mode": flash},
                     )
 
                 elif tool_name == "query_memories":
@@ -611,8 +602,10 @@ async def _run_orchestrator_anthropic(
                 elif tool_name == "run_workflow":
                     wf_id = tool_input.get("workflow_id", "")
                     ctx = tool_input.get("task_context", "")
+                    mem_ctx = tool_input.get("context", "") or None
+                    flash = tool_input.get("flash_mode", True)
                     result_text = await _execute_run_workflow(
-                        wf_id, ctx, ws, session_id, settings
+                        wf_id, ctx, ws, session_id, settings, context=mem_ctx, flash_mode=flash
                     )
 
                 elif tool_name == "start_recording":
@@ -633,9 +626,8 @@ async def _run_orchestrator_anthropic(
                     else:
                         result_text = "No recording data available. Call start_recording first."
 
-                elif tool_name == "search_workflows":
-                    query = tool_input.get("query", "")
-                    result_text = _execute_search_workflows(query)
+                elif tool_name == "list_workflows":
+                    result_text = _execute_list_workflows()
 
                 elif tool_name == "save_as_workflow":
                     wf_name = tool_input.get("name", "workflow")
@@ -748,8 +740,10 @@ async def _run_orchestrator_openai(
                 if tool_name == "run_browser_agent":
                     task = tool_input.get("task", "")
                     context = tool_input.get("context") or None
+                    flash = tool_input.get("flash_mode", True)
                     result_text = await _execute_run_browser_agent(
-                        task, ws, session_id, settings, context=context
+                        task, ws, session_id, settings, context=context,
+                        agent_overrides={"flash_mode": flash},
                     )
 
                 elif tool_name == "query_memories":
@@ -758,8 +752,10 @@ async def _run_orchestrator_openai(
                 elif tool_name == "run_workflow":
                     wf_id = tool_input.get("workflow_id", "")
                     ctx = tool_input.get("task_context", "")
+                    mem_ctx = tool_input.get("context", "") or None
+                    flash = tool_input.get("flash_mode", True)
                     result_text = await _execute_run_workflow(
-                        wf_id, ctx, ws, session_id, settings
+                        wf_id, ctx, ws, session_id, settings, context=mem_ctx, flash_mode=flash
                     )
 
                 elif tool_name == "start_recording":
@@ -780,9 +776,8 @@ async def _run_orchestrator_openai(
                     else:
                         result_text = "No recording data available. Call start_recording first."
 
-                elif tool_name == "search_workflows":
-                    query = tool_input.get("query", "")
-                    result_text = _execute_search_workflows(query)
+                elif tool_name == "list_workflows":
+                    result_text = _execute_list_workflows()
 
                 elif tool_name == "save_as_workflow":
                     wf_name = tool_input.get("name", "workflow")
@@ -830,32 +825,6 @@ async def _run_orchestrator_openai(
 # ── Main entry point ──
 
 
-def _build_orchestrator_context() -> str:
-    """Build context string for the orchestrator system prompt."""
-    from db import get_identity_text
-    from hooks import load_workflows_text
-    from workflow_utils import list_workflows
-
-    parts = []
-    identity = get_identity_text()
-    if identity:
-        parts.append(f"\n\nIdentity:\n{identity}")
-
-    # Include workflow index so the orchestrator knows exact IDs
-    wf_list = list_workflows()
-    if wf_list:
-        lines = ["Available workflows (use the id for run_workflow):"]
-        for wf in wf_list:
-            params = ", ".join(p["name"] for p in wf.get("parameters", []))
-            lines.append(f'  - id="{wf["id"]}", name="{wf.get("name", wf["id"])}", params=[{params}]')
-        parts.append("\n\n" + "\n".join(lines))
-
-    workflows = load_workflows_text()
-    if workflows:
-        parts.append(f"\n\n{workflows}")
-    return "".join(parts)
-
-
 async def run_orchestrator(
     ws: WebSocket,
     session_id: str,
@@ -873,9 +842,6 @@ async def run_orchestrator(
         planning_queues: Shared dict for planning agent queue routing
     """
     try:
-        context = _build_orchestrator_context()
-        system_prompt = ORCHESTRATOR_SYSTEM_PROMPT.format(context=context)
-
         # Wait for first user message
         first_msg = await queue.get()
         if isinstance(first_msg, dict):
@@ -896,7 +862,7 @@ async def run_orchestrator(
                     meta = json.loads(meta)
                 except (json.JSONDecodeError, TypeError):
                     meta = None
-            if meta and meta.get("type") in ("step", "result"):
+            if meta and meta.get("type") in ("step", "result", "tool_call", "workflow_proposal"):
                 continue
             if role in ("user", "assistant") and content:
                 # Collapse consecutive same-role messages
@@ -914,11 +880,11 @@ async def run_orchestrator(
 
         if provider == "anthropic":
             await _run_orchestrator_anthropic(
-                messages, system_prompt, settings, ws, session_id, queue, planning_queues
+                messages, ORCHESTRATOR_SYSTEM_PROMPT, settings, ws, session_id, queue, planning_queues
             )
         else:
             await _run_orchestrator_openai(
-                messages, system_prompt, settings, ws, session_id, queue, planning_queues
+                messages, ORCHESTRATOR_SYSTEM_PROMPT, settings, ws, session_id, queue, planning_queues
             )
 
     except asyncio.CancelledError:

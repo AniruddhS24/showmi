@@ -10,7 +10,33 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from browser_use.llm.anthropic.chat import ChatAnthropic as BrowserUseChatAnthropic
 from browser_use.llm.openai.chat import ChatOpenAI as BrowserUseChatOpenAI
-from pydantic import BaseModel
+from browser_use.llm.views import ChatInvokeCompletion
+from pydantic import BaseModel, ValidationError as PydanticValidationError
+
+
+class _RobustChatOpenAI(BrowserUseChatOpenAI):
+    """BrowserUseChatOpenAI that tolerates trailing whitespace/newlines in JSON responses.
+
+    Local and proxy models often append a trailing newline after the JSON object,
+    which causes Pydantic's model_validate_json to raise "trailing characters".
+    This subclass retries by stripping the raw content and re-validating.
+    """
+
+    async def ainvoke(self, messages, output_format=None, **kwargs):
+        try:
+            return await super().ainvoke(messages, output_format, **kwargs)
+        except PydanticValidationError as exc:
+            if output_format is None or "trailing" not in str(exc).lower():
+                raise
+            # Get raw string response (no structured output enforcement) and strip it
+            raw = await super().ainvoke(messages, None, **kwargs)
+            try:
+                parsed = output_format.model_validate_json(raw.completion.strip())
+                return ChatInvokeCompletion(
+                    completion=parsed, usage=raw.usage, stop_reason=raw.stop_reason
+                )
+            except Exception:
+                raise exc
 
 from agent import _make_browser
 from config import config as default_config
@@ -34,9 +60,7 @@ from db import (
     update_session_status,
     update_session_title,
 )
-from hooks import load_workflows
 from workflow_utils import (
-    compile_recording,
     delete_workflow,
     get_workflow,
     list_workflows,
@@ -247,61 +271,9 @@ class Recording(BaseModel):
     audio_b64: str = ""  # base64 webm audio from microphone
 
 
-class CompileRequest(BaseModel):
-    name: str
-    description: str = ""
-    auto_parameterize: bool = True
-    recording: Recording
-
-
 @app.get("/api/workflows")
 async def api_list_workflows():
     return {"workflows": list_workflows()}
-
-
-@app.post("/api/workflows/compile")
-async def api_compile_workflow(payload: CompileRequest):
-    # Resolve LLM settings from active model
-    settings = {}
-    active = get_active_model()
-    if active:
-        settings = {
-            "provider": active["provider"],
-            "model": active["model"],
-            "base_url": active["base_url"],
-            "api_key": active["api_key"],
-            "temperature": active["temperature"],
-        }
-
-    if not settings.get("api_key"):
-        return JSONResponse(
-            status_code=400,
-            content={"error": "No active model configured. Add a model first."},
-        )
-
-    try:
-        result = await compile_recording(
-            recording=payload.recording.model_dump(),
-            name=payload.name,
-            description=payload.description,
-            auto_parameterize=payload.auto_parameterize,
-            llm_settings=settings,
-        )
-        return {"workflow": result}
-    except ValueError as e:
-        # LLM output couldn't be parsed — return raw output for manual editing
-        return JSONResponse(
-            status_code=422,
-            content={
-                "error": "Could not parse LLM output into workflow format",
-                "raw_output": str(e),
-            },
-        )
-    except Exception as e:
-        return JSONResponse(
-            status_code=500,
-            content={"error": f"Compilation failed: {str(e)}"},
-        )
 
 
 @app.get("/api/workflows/{workflow_id}")
@@ -485,35 +457,7 @@ def _make_step_hook(ws: WebSocket, session_id: str):
 
 
 
-def _build_system_message(context: str | None = None) -> tuple[str | None, list]:
-    """Combine identity, optional context, and workflows into system message.
-
-    Returns (text, image_paths).
-    context is injected between identity and workflows (e.g. memories from orchestrator).
-    """
-    parts = []
-    image_paths = []
-
-    identity = get_identity_text()
-    if identity:
-        parts.append(identity)
-
-    if context:
-        parts.append(f"## Context from orchestrator\n\n{context}")
-
-    workflows = load_workflows()
-    if workflows:
-        workflow_texts = []
-        for wf in workflows:
-            workflow_texts.append(wf["text"])
-            image_paths.extend(wf["images"])
-        parts.append("# Available Workflows\n\n" + "\n\n---\n\n".join(workflow_texts))
-
-    text = "\n\n---\n\n".join(parts) if parts else None
-    return text, image_paths
-
-
-async def run_agent_ws(task: str, ws: WebSocket, session_id: str, settings: dict, context: str | None = None, agent_overrides: dict | None = None) -> None:
+async def run_agent_ws(task: str, ws: WebSocket, session_id: str, settings: dict, agent_overrides: dict | None = None) -> None:
     """Run the browser-use agent, streaming updates over a WebSocket."""
 
     cfg = default_config
@@ -539,19 +483,12 @@ async def run_agent_ws(task: str, ws: WebSocket, session_id: str, settings: dict
             api_key=cfg.llm_api_key,
         )
     else:
-        llm = BrowserUseChatOpenAI(
+        llm = _RobustChatOpenAI(
             base_url=cfg.llm_base_url,
             model=cfg.llm_model,
             temperature=cfg.llm_temperature,
             api_key=cfg.llm_api_key,
         )
-
-    system_message, _workflow_images = _build_system_message(context=context)
-    # TODO: inject _workflow_images as multimodal content when browser-use supports it
-    if system_message:
-        workflow_count = system_message.count("## Workflow:")
-        if workflow_count:
-            print(f"Loaded {workflow_count} workflow(s)")
 
     on_step_start, on_step_end = _make_step_hook(ws, session_id)
 
@@ -561,7 +498,6 @@ async def run_agent_ws(task: str, ws: WebSocket, session_id: str, settings: dict
         "task": task,
         "llm": llm,
         "browser": browser,
-        "extend_system_message": system_message,
         "max_actions_per_step": cfg.max_actions_per_step,
         "max_failures": cfg.max_failures,
         "use_vision": _parse_use_vision(cfg.use_vision),
@@ -570,6 +506,13 @@ async def run_agent_ws(task: str, ws: WebSocket, session_id: str, settings: dict
         "vision_detail_level": cfg.vision_detail_level,
         "max_history_items": cfg.max_history_items or None,
     }
+    if provider != "anthropic":
+        agent_kwargs["page_extraction_llm"] = BrowserUseChatOpenAI(
+            base_url=cfg.llm_base_url,
+            model="gpt-4o-mini",
+            temperature=0.0,
+            api_key=cfg.llm_api_key,
+        )
     if agent_overrides:
         agent_kwargs.update(agent_overrides)
     agent = Agent(**agent_kwargs)

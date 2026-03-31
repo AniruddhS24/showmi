@@ -3,8 +3,7 @@ from browser_use.browser.profile import BrowserProfile
 from browser_use.llm.openai.chat import ChatOpenAI
 
 from config import _parse_use_vision, config
-from db import get_identity_text
-from hooks import load_workflows_text, on_step_end, on_step_start
+from hooks import on_step_end, on_step_start
 
 def _make_browser(cfg=None) -> Browser:
     """Create a Browser instance, using CDP if configured or launching with profile."""
@@ -21,18 +20,6 @@ def _make_browser(cfg=None) -> Browser:
     return Browser(browser_profile=profile)
 
 
-def _build_system_message() -> str | None:
-    """Combine identity and workflows into a system message extension."""
-    parts = []
-    identity = get_identity_text()
-    if identity:
-        parts.append(identity)
-    workflows = load_workflows_text()
-    if workflows:
-        parts.append(workflows)
-    return "\n\n---\n\n".join(parts) if parts else None
-
-
 async def run_agent(task: str) -> None:
     """Run the browser-use agent on the given task."""
     print(f"Task: {task}")
@@ -46,17 +33,11 @@ async def run_agent(task: str) -> None:
         api_key=config.llm_api_key,
     )
 
-    system_message = _build_system_message()
-    if system_message:
-        workflow_count = system_message.count("## Workflow:")
-        if workflow_count:
-            print(f"Loaded {workflow_count} workflow(s)")
-
     agent = Agent(
         task=task,
         llm=llm,
         browser=browser,
-        extend_system_message=system_message,
+        extend_system_message=None,
         max_actions_per_step=config.max_actions_per_step,
         max_failures=config.max_failures,
         use_vision=_parse_use_vision(config.use_vision),

@@ -174,6 +174,13 @@ async function deleteChat(sessionId) {
   } catch {}
 }
 
+async function deleteWorkflow(workflowId) {
+  try {
+    await fetch(`${API_BASE}/api/workflows/${workflowId}`, { method: "DELETE" });
+    loadWorkflows();
+  } catch {}
+}
+
 function renderChats(sessions) {
   if (!sessions.length) {
     chatsList.innerHTML = '<div class="no-chats">no chats yet</div>';
@@ -592,6 +599,7 @@ function connect() {
     // Server cancels all tasks on disconnect — mirror that on the frontend
     Object.values(sessionStates).forEach((s) => { s.isWorking = false; });
     removeThinking();
+    exitPlanningMode();
     updateInputState();
     if (failedConnections >= 2) {
       showDisconnectedBanner();
@@ -1122,7 +1130,7 @@ function cancelTask() {
 const TOOL_LABELS = {
   run_browser_agent: "browser agent",
   run_workflow:      "run workflow",
-  search_workflows:  "search workflows",
+  list_workflows:    "list workflows",
   start_recording:   "recording",
   start_planning:    "planning",
   save_as_workflow:  "save workflow",
@@ -1133,7 +1141,7 @@ const TOOL_LABELS = {
 const TOOL_ICONS = {
   run_browser_agent: "⚡",
   run_workflow:      "▶",
-  search_workflows:  "◎",
+  list_workflows:    "◎",
   start_recording:   "⏺",
   start_planning:    "⚙",
   save_as_workflow:  "◈",
@@ -1185,7 +1193,7 @@ function addToolCallPill(toolName, args) {
   let detail = "";
   if (toolName === "run_browser_agent") detail = (args.task || "").substring(0, 100);
   else if (toolName === "run_workflow")  detail = args.workflow_id || "";
-  else if (toolName === "search_workflows") detail = args.query || "all";
+  else if (toolName === "list_workflows")   detail = "";
   else if (toolName === "save_as_workflow") detail = args.name || "";
   else if (toolName === "start_recording") detail = (args.instruction || "").substring(0, 60);
 
@@ -1274,22 +1282,33 @@ async function loadWorkflows() {
 
     workflowsList.innerHTML = "";
     for (const wf of workflows) {
-      const item = document.createElement("button");
+      const item = document.createElement("div");
       item.className = "chat-item";
-      item.innerHTML = `<span class="chat-title">${wf.name}</span><span class="chat-date">${wf.description || ""}</span>`;
-      item.addEventListener("click", () => {
+      item.innerHTML = `
+        <div class="chat-item-row">
+          <div class="chat-item-title">${escapeHtml(wf.name)}</div>
+          <button class="chat-item-delete icon-btn" title="Delete">
+            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+            </svg>
+          </button>
+        </div>
+        <div class="chat-item-date">${escapeHtml(wf.description || "")}</div>
+      `;
+      item.querySelector(".chat-item-delete").addEventListener("click", (e) => {
+        e.stopPropagation();
+        deleteWorkflow(wf.id);
+      });
+      item.addEventListener("click", (e) => {
+        if (e.target.closest(".chat-item-delete")) return;
         workflowsDrawer.classList.add("hidden");
-        // Start a new session and run the workflow
         currentSessionId = null;
         messagesEl.querySelectorAll(".msg, .thinking").forEach(el => el.remove());
         if (emptyStateEl) emptyStateEl.style.display = "none";
         const text = `Run workflow: ${wf.name}`;
         addMessage("user", text);
         if (ws && ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({
-            type: "message",
-            content: text,
-          }));
+          ws.send(JSON.stringify({ type: "message", content: text }));
           showThinking();
         }
       });
@@ -1469,8 +1488,20 @@ function exitPlanningMode() {
   lastProposedManifest = null;
   lastProposedMarkdown = null;
   if (planningBar) planningBar.classList.add("hidden");
-  if (planningApprove) planningApprove._pending = false;
-  if (planningReject) planningReject._pending = false;
+  if (planningApprove) {
+    planningApprove._pending = false;
+    planningApprove.disabled = false;
+    planningApprove.textContent = "approve";
+  }
+  if (planningReject) {
+    planningReject._pending = false;
+    planningReject.disabled = false;
+    planningReject.textContent = "reject";
+  }
+  if (planningTest) {
+    planningTest.disabled = false;
+    planningTest.textContent = "test";
+  }
   updateInputState();
 }
 
@@ -1602,12 +1633,16 @@ if (planningApprove) {
       fileContent = `---\n${yaml}\n---\n\n${lastProposedMarkdown.trim()}\n`;
     }
 
+    const saveController = new AbortController();
+    const saveTimeout = setTimeout(() => saveController.abort(), 15000);
     try {
       const res = await fetch(`${API_BASE}/api/workflows`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ file_content: fileContent }),
+        signal: saveController.signal,
       });
+      clearTimeout(saveTimeout);
       const result = await res.json();
       if (res.ok && result.ok) {
         addMessage("system", `Workflow saved: ${result.id}`);
@@ -1634,7 +1669,9 @@ if (planningApprove) {
         exitPlanningMode();
       }
     } catch (err) {
-      addMessage("error", `Save failed: ${err.message}`);
+      clearTimeout(saveTimeout);
+      const msg = err.name === "AbortError" ? "Save timed out. Please try again." : `Save failed: ${err.message}`;
+      addMessage("error", msg);
       exitPlanningMode();
     }
     // exitPlanningMode() clears _pending and hides the bar — no explicit re-enable needed
@@ -1647,8 +1684,12 @@ if (planningReject) {
     planningReject._pending = true;
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: "planning_action", session_id: currentSessionId, action: "reject" }));
+      // Let planning_complete event drive exitPlanningMode and "Workflow discarded." message
+    } else {
+      // WS is down — can't notify server, clean up locally
+      addMessage("system", "Workflow discarded.");
+      exitPlanningMode();
     }
-    // Let planning_complete event drive exitPlanningMode and "Workflow discarded." message
   });
 }
 
