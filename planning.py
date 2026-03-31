@@ -442,6 +442,7 @@ async def _run_anthropic_planning(
                     # Handle structured responses
                     if isinstance(user_response, dict):
                         if user_response.get("type") == "approve":
+                            queue._outcome = "approved"
                             tool_results.append({
                                 "type": "tool_result",
                                 "tool_use_id": block.id,
@@ -450,6 +451,7 @@ async def _run_anthropic_planning(
                             messages.append({"role": "user", "content": tool_results})
                             return
                         elif user_response.get("type") == "reject":
+                            queue._outcome = "rejected"
                             tool_results.append({
                                 "type": "tool_result",
                                 "tool_use_id": block.id,
@@ -580,6 +582,7 @@ async def _run_openai_planning(
 
                     if isinstance(user_response, dict):
                         if user_response.get("type") in ("approve", "reject"):
+                            queue._outcome = user_response["type"]
                             openai_messages.append({
                                 "role": "tool",
                                 "tool_call_id": tc.id,

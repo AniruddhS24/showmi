@@ -410,7 +410,13 @@ async def _execute_start_planning(
 
     try:
         await run_planning_agent(recording, ws, session_id, settings, planning_queue)
-        return "Workflow planning completed. The user has been asked to approve or reject."
+        outcome = getattr(planning_queue, "_outcome", None)
+        if outcome == "approved":
+            return "Workflow approved and saved by the user."
+        elif outcome == "rejected":
+            return "Workflow rejected by the user."
+        else:
+            return "Workflow planning completed. The user has been asked to approve or reject."
     except asyncio.CancelledError:
         return "Workflow planning was cancelled."
     except Exception as e:
@@ -517,6 +523,11 @@ async def _execute_save_as_workflow(
         await run_planning_agent_from_context(
             context_text, ws, session_id, settings, planning_queue
         )
+        outcome = getattr(planning_queue, "_outcome", None)
+        if outcome == "approved":
+            return "Workflow approved and saved by the user."
+        elif outcome == "rejected":
+            return "Workflow rejected by the user."
         proposed = getattr(planning_queue, "_last_proposed_markdown", None)
         if proposed:
             return "Workflow created from conversation. The user has been asked to approve or reject."
