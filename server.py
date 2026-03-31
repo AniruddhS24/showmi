@@ -20,7 +20,6 @@ from db import (
     create_session,
     get_context_summary,
     get_identity_text,
-    get_memory_text,
     get_session_messages,
     init_db,
     list_memories,
@@ -211,7 +210,7 @@ async def get_identity():
 
 @app.get("/memory")
 async def get_memory():
-    return {"content": get_memory_text(), "entries": list_memories()}
+    return {"entries": list_memories()}
 
 
 # ── REST: Workflow CRUD & Compilation ──
@@ -484,11 +483,13 @@ def _make_step_hook(ws: WebSocket, session_id: str):
     return on_step_start, on_step_end
 
 
-def _build_system_message() -> tuple[str | None, list]:
-    """Combine identity, memory, and workflows into system message text + images.
 
-    Returns (text, image_paths) where image_paths is a list of Path objects
-    for workflow screenshots that should be included as multimodal content.
+
+def _build_system_message(context: str | None = None) -> tuple[str | None, list]:
+    """Combine identity, optional context, and workflows into system message.
+
+    Returns (text, image_paths).
+    context is injected between identity and workflows (e.g. memories from orchestrator).
     """
     parts = []
     image_paths = []
@@ -496,9 +497,9 @@ def _build_system_message() -> tuple[str | None, list]:
     identity = get_identity_text()
     if identity:
         parts.append(identity)
-    memory = get_memory_text()
-    if memory:
-        parts.append(memory)
+
+    if context:
+        parts.append(f"## Context from orchestrator\n\n{context}")
 
     workflows = load_workflows()
     if workflows:
@@ -512,7 +513,7 @@ def _build_system_message() -> tuple[str | None, list]:
     return text, image_paths
 
 
-async def run_agent_ws(task: str, ws: WebSocket, session_id: str, settings: dict, agent_overrides: dict | None = None) -> None:
+async def run_agent_ws(task: str, ws: WebSocket, session_id: str, settings: dict, context: str | None = None, agent_overrides: dict | None = None) -> None:
     """Run the browser-use agent, streaming updates over a WebSocket."""
 
     cfg = default_config
@@ -545,7 +546,7 @@ async def run_agent_ws(task: str, ws: WebSocket, session_id: str, settings: dict
             api_key=cfg.llm_api_key,
         )
 
-    system_message, _workflow_images = _build_system_message()
+    system_message, _workflow_images = _build_system_message(context=context)
     # TODO: inject _workflow_images as multimodal content when browser-use supports it
     if system_message:
         workflow_count = system_message.count("## Workflow:")
@@ -619,6 +620,7 @@ async def run_agent_ws(task: str, ws: WebSocket, session_id: str, settings: dict
         print(f"Result: {history.final_result()}")
     if error_strings:
         print(f"Errors: {error_strings}")
+
 
     return result_summary
 
@@ -697,7 +699,9 @@ async def websocket_endpoint(ws: WebSocket):
                 if action == "approve":
                     if q:
                         await q.put({"type": "approve"})
-                    await ws.send_json({"type": "planning_complete", "session_id": sid})
+                    # Frontend handles its own UI (exitPlanningMode + status message)
+                    # so we don't send planning_complete here to avoid a spurious
+                    # "Workflow discarded." message from the generic handler.
 
                 elif action == "reject":
                     if q:
@@ -872,6 +876,8 @@ async def websocket_endpoint(ws: WebSocket):
         for task_handle in _running_tasks.values():
             task_handle.cancel()
         _running_tasks.clear()
+        _orchestrator_queues.clear()
+        _planning_queues.clear()
 
 
 if __name__ == "__main__":

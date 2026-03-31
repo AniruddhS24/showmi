@@ -1,4 +1,5 @@
 import json
+import re
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -11,7 +12,6 @@ CHATS_DIR = SHOWMI_DIR / "chats"
 WORKFLOWS_DIR = SHOWMI_DIR / "workflows"
 DB_PATH = SHOWMI_DIR / "data.db"
 IDENTITY_PATH = SHOWMI_DIR / "IDENTITY.md"
-MEMORY_PATH = SHOWMI_DIR / "MEMORY.md"
 
 
 @contextmanager
@@ -65,19 +65,7 @@ def init_db() -> None:
             )
             """
         )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS memories (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                category TEXT NOT NULL,
-                content TEXT NOT NULL,
-                source_session_id TEXT,
-                created_at TIMESTAMP NOT NULL,
-                updated_at TIMESTAMP NOT NULL,
-                FOREIGN KEY (source_session_id) REFERENCES sessions(id)
-            )
-            """
-        )
+        _init_memories_schema(conn)
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS models (
@@ -103,9 +91,6 @@ def init_db() -> None:
             "You help users accomplish tasks in their web browser efficiently and accurately.\n"
         )
 
-    # Create empty MEMORY.md if it doesn't exist
-    if not MEMORY_PATH.exists():
-        MEMORY_PATH.write_text("# Agent Memory\n\nNo memories stored yet.\n")
 
 
 # ── Sessions ──
@@ -286,88 +271,208 @@ def delete_model(model_id: str) -> None:
         conn.execute("DELETE FROM models WHERE id = ?", (model_id,))
 
 
-# ── Memory CRUD ──
+# ── Memory ──
+
+
+def _sanitize_fts_query(query: str) -> str:
+    """Strip characters that cause FTS5 parse errors."""
+    import re
+    return re.sub(r'["\'\(\)\:\*\^]', ' ', query).strip()
+
+
+def _init_memories_schema(conn: sqlite3.Connection) -> None:
+    """Create or migrate the memories table to the typed schema with FTS5 support."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(memories)").fetchall()}
+    if cols and "type" not in cols:
+        # Old schema detected — drop everything and recreate
+        conn.execute("DROP TRIGGER IF EXISTS memories_fts_update")
+        conn.execute("DROP TRIGGER IF EXISTS memories_fts_delete")
+        conn.execute("DROP TRIGGER IF EXISTS memories_fts_insert")
+        conn.execute("DROP TABLE IF EXISTS memories_fts")
+        conn.execute("DROP TABLE IF EXISTS memories")
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS memories (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            type                TEXT NOT NULL CHECK(type IN ('episodic','procedural','semantic')),
+            content             TEXT NOT NULL,
+            workflow_slug       TEXT,
+            evidence_session_id TEXT REFERENCES sessions(id),
+            num_uses            INTEGER NOT NULL DEFAULT 0,
+            priority            INTEGER NOT NULL DEFAULT 0,
+            created_at          TEXT NOT NULL,
+            last_used_at        TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts
+        USING fts5(content, content=memories, content_rowid=id)
+    """)
+    conn.execute("""
+        CREATE TRIGGER IF NOT EXISTS memories_fts_insert AFTER INSERT ON memories BEGIN
+            INSERT INTO memories_fts(rowid, content) VALUES (new.id, new.content);
+        END
+    """)
+    conn.execute("""
+        CREATE TRIGGER IF NOT EXISTS memories_fts_delete AFTER DELETE ON memories BEGIN
+            INSERT INTO memories_fts(memories_fts, rowid, content)
+            VALUES ('delete', old.id, old.content);
+        END
+    """)
+    conn.execute("""
+        CREATE TRIGGER IF NOT EXISTS memories_fts_update AFTER UPDATE ON memories BEGIN
+            INSERT INTO memories_fts(memories_fts, rowid, content)
+            VALUES ('delete', old.id, old.content);
+            INSERT INTO memories_fts(rowid, content) VALUES (new.id, new.content);
+        END
+    """)
+
+
+def _sanitize_memory_content(text: str) -> str:
+    """Strip JSON fragments and special characters that could break LLM JSON output.
+
+    Memory content is injected into browser agent system prompts. Curly braces,
+    square brackets, and backslashes can be mistaken for JSON action schemas and
+    cause Pydantic AgentOutput validation errors.
+    """
+    # Remove JSON-like objects and arrays
+    text = re.sub(r"\{[^}]*\}", "", text)
+    text = re.sub(r"\[[^\]]*\]", "", text)
+    # Remove stray structural characters and backslashes
+    text = re.sub(r'[{}\[\]\\]', "", text)
+    # Collapse multiple spaces
+    text = re.sub(r"  +", " ", text).strip()
+    return text
 
 
 def add_memory(
-    category: str, content: str, source_session_id: str | None = None
+    type: str,
+    content: str,
+    workflow_slug: str | None = None,
+    evidence_session_id: str | None = None,
+    priority: int = 0,
 ) -> int:
-    """Add a memory entry and rebuild the MEMORY.md file. Returns the new memory ID."""
+    """Insert a new memory. FTS5 trigger handles indexing. Returns new ID."""
+    content = _sanitize_memory_content(content)
     now = datetime.now(timezone.utc).isoformat()
     with get_connection() as conn:
         cursor = conn.execute(
-            "INSERT INTO memories (category, content, source_session_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-            (category, content, source_session_id, now, now),
+            """INSERT INTO memories
+               (type, content, workflow_slug, evidence_session_id,
+                num_uses, priority, created_at, last_used_at)
+               VALUES (?, ?, ?, ?, 0, ?, ?, ?)""",
+            (type, content, workflow_slug, evidence_session_id, priority, now, now),
         )
-        memory_id = cursor.lastrowid
-    rebuild_memory_file()
-    return memory_id
+        return cursor.lastrowid
 
 
-def list_memories(category: str | None = None) -> list[dict]:
-    """Return all memories, optionally filtered by category, most recent first."""
+def retrieve_memories(
+    query: str,
+    workflow_slug: str | None = None,
+    limit: int = 3,
+) -> list[dict]:
+    """Retrieve top memories by FTS5 BM25 + priority/recency. Falls back to recency if no FTS match."""
+    safe_q = _sanitize_fts_query(query)
     with get_connection() as conn:
-        if category:
-            rows = conn.execute(
-                "SELECT id, category, content, source_session_id, created_at, updated_at FROM memories WHERE category = ? ORDER BY created_at DESC",
-                (category,),
-            ).fetchall()
+        rows = []
+        if safe_q:
+            slug_filter = "AND m.workflow_slug = ?" if workflow_slug else ""
+            params: list = [safe_q]
+            if workflow_slug:
+                params.append(workflow_slug)
+            params.append(limit)
+            try:
+                rows = conn.execute(f"""
+                    SELECT m.id, m.type, m.content, m.workflow_slug,
+                           m.num_uses, m.priority, m.last_used_at
+                    FROM memories m
+                    JOIN memories_fts fts ON fts.rowid = m.id
+                    WHERE memories_fts MATCH ?
+                      {slug_filter}
+                    ORDER BY
+                        m.priority DESC,
+                        bm25(memories_fts) ASC,
+                        CASE WHEN julianday('now') - julianday(m.last_used_at) > 90 THEN 0 ELSE 1 END DESC,
+                        m.num_uses DESC,
+                        m.last_used_at DESC
+                    LIMIT ?
+                """, params).fetchall()
+            except Exception:
+                rows = []
+
+        if not rows:
+            slug_filter = "WHERE workflow_slug = ?" if workflow_slug else ""
+            fallback_params: list = ([workflow_slug] if workflow_slug else []) + [limit]
+            rows = conn.execute(f"""
+                SELECT id, type, content, workflow_slug, num_uses, priority, last_used_at
+                FROM memories
+                {slug_filter}
+                ORDER BY priority DESC, num_uses DESC, last_used_at DESC
+                LIMIT ?
+            """, fallback_params).fetchall()
+
+    return [dict(row) for row in rows]
+
+
+def use_memory(memory_id: int, session_id: str | None = None) -> None:
+    """Increment num_uses, refresh last_used_at, optionally update evidence_session_id."""
+    now = datetime.now(timezone.utc).isoformat()
+    with get_connection() as conn:
+        if session_id:
+            conn.execute(
+                """UPDATE memories
+                   SET num_uses = num_uses + 1, last_used_at = ?, evidence_session_id = ?
+                   WHERE id = ?""",
+                (now, session_id, memory_id),
+            )
         else:
-            rows = conn.execute(
-                "SELECT id, category, content, source_session_id, created_at, updated_at FROM memories ORDER BY created_at DESC"
-            ).fetchall()
+            conn.execute(
+                "UPDATE memories SET num_uses = num_uses + 1, last_used_at = ? WHERE id = ?",
+                (now, memory_id),
+            )
+
+
+def update_memory(
+    memory_id: int,
+    content: str | None = None,
+    priority: int | None = None,
+) -> None:
+    """Update content and/or priority of a memory."""
+    now = datetime.now(timezone.utc).isoformat()
+    with get_connection() as conn:
+        if content is not None and priority is not None:
+            conn.execute(
+                "UPDATE memories SET content=?, priority=?, last_used_at=? WHERE id=?",
+                (content, priority, now, memory_id),
+            )
+        elif content is not None:
+            conn.execute(
+                "UPDATE memories SET content=?, last_used_at=? WHERE id=?",
+                (content, now, memory_id),
+            )
+        elif priority is not None:
+            conn.execute(
+                "UPDATE memories SET priority=? WHERE id=?",
+                (priority, memory_id),
+            )
+
+
+def list_memories() -> list[dict]:
+    """Return all memories ordered by priority DESC, last_used_at DESC. For REST API."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            """SELECT id, type, content, workflow_slug, evidence_session_id,
+                      num_uses, priority, created_at, last_used_at
+               FROM memories
+               ORDER BY priority DESC, last_used_at DESC"""
+        ).fetchall()
     return [dict(row) for row in rows]
 
 
 def delete_memory(memory_id: int) -> None:
-    """Delete a memory by ID and rebuild the MEMORY.md file."""
+    """Delete a memory by ID. FTS5 trigger handles deindexing."""
     with get_connection() as conn:
         conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
-    rebuild_memory_file()
-
-
-CATEGORY_LABELS = {
-    "preference": "User Preferences",
-    "website_knowledge": "Website Knowledge",
-    "workflow_learning": "Workflow Learnings",
-    "general": "General",
-}
-
-
-def rebuild_memory_file() -> None:
-    """Read all memories from the database and write MEMORY.md grouped by category."""
-    memories = list_memories()
-    now = datetime.now(timezone.utc).isoformat()
-
-    grouped: dict[str, list[str]] = {}
-    for mem in memories:
-        cat = mem["category"]
-        grouped.setdefault(cat, []).append(mem["content"])
-
-    lines = [f"# Agent Memory\n", f"Last updated: {now}\n"]
-
-    for cat_key, label in CATEGORY_LABELS.items():
-        entries = grouped.pop(cat_key, [])
-        if entries:
-            lines.append(f"\n## {label}\n")
-            for entry in entries:
-                lines.append(f"- {entry}")
-
-    # Any categories not in CATEGORY_LABELS
-    for cat_key, entries in grouped.items():
-        if entries:
-            lines.append(f"\n## {cat_key.replace('_', ' ').title()}\n")
-            for entry in entries:
-                lines.append(f"- {entry}")
-
-    MEMORY_PATH.write_text("\n".join(lines) + "\n")
-
-
-def get_memory_text() -> str:
-    """Return the contents of MEMORY.md, or empty string if it doesn't exist."""
-    if MEMORY_PATH.exists():
-        return MEMORY_PATH.read_text()
-    return ""
 
 
 def get_identity_text() -> str:

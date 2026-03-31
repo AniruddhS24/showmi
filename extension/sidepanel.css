@@ -82,9 +82,9 @@ body {
    ═══════════════════════════════════════ */
 
 #header {
-  display: flex;
+  display: grid;
+  grid-template-columns: auto 1fr auto;
   align-items: center;
-  justify-content: space-between;
   padding: 4px 8px;
   background: var(--bg);
   flex-shrink: 0;
@@ -94,7 +94,42 @@ body {
 .header-left, .header-right {
   display: flex;
   align-items: center;
-  gap: 5px;
+  gap: 4px;
+}
+
+.header-center {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  padding: 0 6px;
+}
+
+.chat-title {
+  font-size: 10px;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  letter-spacing: 0.2px;
+}
+
+.label-btn {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  padding: 3px 6px;
+  border-radius: var(--r-sm);
+  font-family: var(--font);
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.3px;
+  transition: color var(--duration), background var(--duration);
+}
+.label-btn:hover {
+  color: var(--text);
+  background: var(--bg-hover);
 }
 
 /* Status dot — kept round (it's a dot) */
@@ -157,7 +192,7 @@ body {
   font-size: 10px;
   cursor: pointer;
   transition: color var(--duration), border-color var(--duration);
-  max-width: 140px;
+  max-width: 160px;
 }
 
 .model-badge:hover {
@@ -173,8 +208,9 @@ body {
 
 .model-dropdown {
   position: absolute;
-  top: calc(100% + 3px);
-  right: 0;
+  bottom: calc(100% + 3px);
+  top: auto;
+  left: 0;
   width: 200px;
   background: var(--bg);
   border: 1px dotted var(--border-dot);
@@ -596,6 +632,32 @@ body {
   padding-right: 22px;
 }
 
+.select-with-icon {
+  position: relative;
+  width: 100%;
+}
+.select-with-icon select {
+  width: 100%;
+  padding-left: 26px;
+}
+.provider-icon {
+  position: absolute;
+  left: 7px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: flex;
+  align-items: center;
+  pointer-events: none;
+  z-index: 1;
+}
+
+.model-badge-icon {
+  display: flex;
+  align-items: center;
+  margin-right: 3px;
+  flex-shrink: 0;
+}
+
 .input-with-toggle {
   position: relative;
 }
@@ -804,10 +866,10 @@ body {
 #messages {
   flex: 1;
   overflow-y: auto;
-  padding: 8px 10px;
+  padding: 10px 10px;
   display: flex;
   flex-direction: column;
-  gap: 0;
+  gap: 12px;
 }
 
 #messages::-webkit-scrollbar { width: 3px; }
@@ -840,7 +902,7 @@ body {
 }
 
 .message.user {
-  margin: 10px 0 4px 0;
+  margin: 0;
   padding: 5px 8px;
   background: var(--accent-dim);
   border-left: 2px solid var(--accent);
@@ -850,7 +912,7 @@ body {
 }
 
 .message.error {
-  margin: 6px 0;
+  margin: 0;
   padding: 5px 8px;
   border-left: 2px solid var(--error);
   border-radius: var(--r-sm);
@@ -1157,10 +1219,25 @@ body {
    ═══════════════════════════════════════ */
 
 #input-area {
-  padding: 6px 8px;
+  padding: 5px 8px 7px;
   background: var(--bg);
   border-top: 1px dotted var(--border-dot);
   flex-shrink: 0;
+}
+
+.input-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 5px;
+}
+
+.logs-btn-discreet {
+  opacity: 0.4;
+  padding: 2px 3px;
+}
+.logs-btn-discreet:hover {
+  opacity: 1;
 }
 
 /* Tab context badge */
@@ -1392,6 +1469,152 @@ body {
   font-size: 10px;
   color: var(--text-dim);
   text-align: center;
+}
+
+/* ── Tool call pill (inline chat event) ── */
+.tool-call-pill {
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  padding: 3px 10px;
+  margin: 1px 0;
+  background: var(--bg-elevated);
+  border-left: 2px solid var(--border-dot);
+  border-radius: var(--r-sm);
+  font-size: 10px;
+  color: var(--text-dim);
+  line-height: 1.5;
+}
+
+/* Memory variant — accented */
+.tool-call-pill.memory-pill {
+  background: var(--accent-dim);
+  border-left-color: var(--accent);
+  color: var(--text-muted);
+}
+
+.tool-call-icon {
+  font-size: 8px;
+  color: var(--text-dim);
+  flex-shrink: 0;
+}
+
+.tool-call-pill.memory-pill .tool-call-icon {
+  color: var(--accent-text);
+}
+
+.tool-call-label {
+  font-weight: 600;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.tool-call-pill.memory-pill .tool-call-label {
+  color: var(--accent-text);
+}
+
+.tool-call-priority {
+  font-size: 9px;
+  color: var(--warning);
+  font-weight: 600;
+  flex-shrink: 0;
+}
+
+.tool-call-detail {
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── Memory context pill (shown in chat when memories are injected) ── */
+.tool-call-pill.memory-context-pill {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  background: rgba(46,160,67,0.07);
+  border-color: rgba(46,160,67,0.18);
+}
+
+.tool-call-pill.memory-context-pill .tool-call-icon { color: var(--success); }
+.tool-call-pill.memory-context-pill .tool-call-label { color: var(--success); }
+
+.memory-context-items {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  width: 100%;
+}
+
+.memory-context-item {
+  display: flex;
+  gap: 5px;
+  align-items: baseline;
+}
+
+.memory-context-type {
+  font-size: 9px;
+  font-weight: 600;
+  color: var(--text-dim);
+  white-space: nowrap;
+  min-width: 42px;
+}
+
+.memory-context-text {
+  font-size: 10px;
+  color: var(--text-dim);
+  line-height: 1.4;
+}
+
+/* ── Memory drawer items ── */
+.memory-item {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.memory-item:last-child { border-bottom: none; }
+
+.memory-item-header {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+}
+
+.memory-item-type {
+  font-size: 9px;
+  font-weight: 600;
+  padding: 1px 4px;
+  border-radius: var(--r-sm);
+  letter-spacing: 0.03em;
+}
+
+.memory-item-type.procedural { background: rgba(94,106,210,0.12); color: var(--accent-text); }
+.memory-item-type.episodic   { background: rgba(46,160,67,0.10);  color: var(--success); }
+.memory-item-type.semantic   { background: rgba(210,153,34,0.10); color: var(--warning); }
+
+.memory-item-priority {
+  font-size: 9px;
+  font-weight: 600;
+  color: var(--warning);
+  padding: 1px 4px;
+  border: 1px solid var(--warning);
+  border-radius: var(--r-sm);
+}
+
+.memory-item-meta {
+  font-size: 9px;
+  color: var(--text-dim);
+  margin-left: auto;
+}
+
+.memory-item-content {
+  font-size: 10px;
+  color: var(--text);
+  line-height: 1.5;
 }
 
 /* ═══════════════════════════════════════

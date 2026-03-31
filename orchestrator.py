@@ -23,49 +23,50 @@ ORCHESTRATOR_SYSTEM_PROMPT = """\
 You are an orchestrator for a browser automation assistant called Showmi. The user \
 talks to you naturally and you decide what to do.
 
-You have six tools:
+You have eight tools:
 
 1. **run_browser_agent** — Execute a browser automation task. Use this when the user \
 wants something DONE in their browser (navigate, click, fill forms, extract data, etc.). \
-Pass a clear, detailed task description.
+Pass a clear, detailed task description. Optionally pass 'context' with relevant memories.
 
-2. **run_workflow** — Run a saved workflow by name or ID. Use this when the user asks to \
-run a specific workflow. The workflow file will be loaded and passed to the browser agent \
-as detailed instructions. If the workflow has parameters (like {{destination}}), ask the \
-user for values first, then include them in the task.
+2. **run_workflow** — Run a saved workflow by name or ID. The workflow file will be loaded \
+and passed to the browser agent as detailed instructions. If the workflow has parameters \
+(like {{destination}}), ask the user for values first.
 
 3. **search_workflows** — Search or list all saved workflows. Use this when the user asks \
 about available workflows, or when you want to check if a matching workflow already exists \
-before running a browser task from scratch. Returns workflow IDs, names, descriptions, \
-and parameters.
+before running a browser task from scratch.
 
-4. **start_recording** — Ask the user to demonstrate a workflow by recording their browser \
-actions. Use this when the user wants to TEACH you something new, e.g.:
-   - "let me show you how to..."
-   - "I want to create a workflow for..."
-   - "record how I do X"
-   - "teach you to do X"
-   After recording completes, you will automatically receive the recording data.
+4. **query_memories** — Search stored memories for context relevant to a task. Call this \
+before run_browser_agent when the task involves a site or workflow the user has used before. \
+Pass the result as 'context' to run_browser_agent. Also call this when the user asks what \
+you remember about something.
 
-5. **start_planning** — Process a recorded demonstration into a reusable workflow. \
-Call this IMMEDIATELY after you receive recording data from start_recording. \
-Pass the recording data as-is.
+5. **store_memory** — Persist a correction, preference, or lesson learned as a memory. \
+Call this when: the user corrects you, states a persistent preference, or after a browser \
+run reveals a non-obvious site trick worth remembering. \
+Use type='procedural' + priority=1 for corrections. Use type='semantic' for preferences. \
+Use type='episodic' for a one-sentence summary of what a browser run did and how.
 
-6. **save_as_workflow** — Save the current session's browser actions as a reusable workflow. \
-Use when the user says "save this as a workflow", "remember how to do this", or wants to \
-create a workflow from what the agent just did (no recording needed).
+6. **start_recording** — Ask the user to demonstrate a workflow by recording their browser \
+actions. Use when the user wants to TEACH you something new.
+
+7. **start_planning** — Process a recorded demonstration into a reusable workflow. \
+Call this IMMEDIATELY after receiving recording data from start_recording.
+
+8. **save_as_workflow** — Save the current session's browser actions as a reusable workflow.
 
 Guidelines:
+- Before running a browser task on a specific site → query_memories first, then pass results as context
+- After a browser run that revealed something non-obvious → store_memory with what was learned
 - For direct browser tasks → run_browser_agent
 - To find a matching workflow → search_workflows, then run_workflow with the ID
-- For running a saved workflow → run_workflow
-- For teaching/demonstrating → start_recording, then start_planning
-- To save the current session as a workflow → save_as_workflow
 - For questions or conversation → respond directly (no tool call)
 - Always briefly acknowledge what you're about to do before calling a tool
 - After a sub-agent finishes, summarize the result for the user
 - If the user's intent is ambiguous, ask a clarifying question before acting
-- When running a workflow with parameters, collect parameter values from the user first
+- When the user corrects you or states a persistent preference, call store_memory BEFORE \
+acknowledging. Do not ask for confirmation — just store it and confirm.
 {context}\
 """
 
@@ -81,6 +82,10 @@ ANTHROPIC_TOOLS = [
                 "task": {
                     "type": "string",
                     "description": "Detailed task description for the browser agent",
+                },
+                "context": {
+                    "type": "string",
+                    "description": "Optional context to inject into the agent's system prompt, e.g. relevant memories retrieved via query_memories.",
                 },
             },
             "required": ["task"],
@@ -160,6 +165,54 @@ ANTHROPIC_TOOLS = [
             "required": ["name"],
         },
     },
+    {
+        "name": "query_memories",
+        "description": (
+            "Search stored memories for context relevant to a task. "
+            "Call this before run_browser_agent when the task involves a site or workflow "
+            "the user has used before. Returns matching memories you can pass as 'context' "
+            "to run_browser_agent. Also call this when the user asks what you remember about something."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Keywords describing what to search for, e.g. 'linkedin search' or 'gmail draft'",
+                },
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "store_memory",
+        "description": (
+            "Persist a correction, user preference, or site-specific trick as a memory. "
+            "Call this when the user corrects you, says 'next time do X', 'remember that', "
+            "'always use X for Y', 'don't forget', or provides any instruction that should "
+            "persist across sessions. Use type='procedural' + priority=1 for corrections."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "enum": ["episodic", "procedural", "semantic"],
+                    "description": "episodic = what happened in a specific run; procedural = site trick or how-to; semantic = general fact about the user or their preferences",
+                },
+                "content": {
+                    "type": "string",
+                    "description": "The memory content. Be specific and concise — one sentence, under 150 chars.",
+                },
+                "priority": {
+                    "type": "integer",
+                    "enum": [0, 1],
+                    "description": "1 = high priority (use for human corrections), 0 = normal",
+                },
+            },
+            "required": ["type", "content"],
+        },
+    },
 ]
 
 OPENAI_TOOLS = [
@@ -189,16 +242,42 @@ async def _safe_send(ws: WebSocket, data: dict) -> bool:
 # ── Tool execution ──
 
 
+def _execute_query_memories(query: str) -> str:
+    """Search stored memories and return formatted results."""
+    from db import retrieve_memories
+    memories = retrieve_memories(query, limit=5)
+    if not memories:
+        return "No relevant memories found."
+    _TYPE_LABELS = {"episodic": "Past run", "procedural": "How-to", "semantic": "Fact"}
+    lines = [f"Found {len(memories)} relevant memories:\n"]
+    for m in memories:
+        label = _TYPE_LABELS.get(m["type"], m["type"])
+        lines.append(f"- [{label}] {m['content']}")
+    return "\n".join(lines)
+
+
 async def _execute_run_browser_agent(
     task: str, ws: WebSocket, session_id: str, settings: dict,
+    context: str | None = None,
     agent_overrides: dict | None = None,
 ) -> str:
     """Execute the browser agent and return a result summary."""
     from server import run_agent_ws
 
     try:
-        result = await run_agent_ws(task, ws, session_id, settings, agent_overrides=agent_overrides)
-        return result or "Browser agent completed (no result text)."
+        result = await run_agent_ws(
+            task, ws, session_id, settings,
+            context=context,
+            agent_overrides=agent_overrides,
+        )
+        summary = result or "Browser agent completed (no result text)."
+        return (
+            f"{summary}\n\n"
+            "---\n"
+            "If this run revealed a non-obvious site trick or navigation approach worth "
+            "remembering for future runs, call store_memory now (type='procedural' or "
+            "'episodic'). Skip if the run was routine."
+        )
     except Exception as e:
         return f"Browser agent failed: {e}"
 
@@ -338,6 +417,17 @@ async def _execute_start_planning(
         return f"Workflow planning failed: {e}"
     finally:
         planning_queues.pop(session_id, None)
+
+
+def _execute_store_memory(type: str, content: str, priority: int = 0) -> str:
+    """Write a memory from the orchestrator context."""
+    from db import add_memory
+    try:
+        memory_id = add_memory(type=type, content=content, priority=priority)
+        label = "high-priority" if priority == 1 else "normal"
+        return f"Memory stored (id={memory_id}, type={type}, priority={label}): {content[:100]}"
+    except Exception as e:
+        return f"Failed to store memory: {e}"
 
 
 def _execute_search_workflows(query: str = "") -> str:
@@ -487,27 +577,35 @@ async def _run_orchestrator_anthropic(
                 tool_input = block.input
                 result_text = ""
 
+                # Emit tool call to frontend and persist for all tools
+                add_message(session_id, "assistant", f"[{tool_name}]",
+                            metadata={"type": "tool_call", "tool": tool_name, "args": tool_input})
+                await _safe_send(ws, {
+                    "type": "tool_call_start",
+                    "session_id": session_id,
+                    "tool": tool_name,
+                    "args": tool_input,
+                })
+
                 if tool_name == "run_browser_agent":
                     task = tool_input.get("task", "")
-                    add_message(session_id, "assistant", f"[Running browser agent: {task[:200]}]",
-                                metadata={"type": "tool_call", "tool": tool_name, "args": tool_input})
+                    context = tool_input.get("context") or None
                     result_text = await _execute_run_browser_agent(
-                        task, ws, session_id, settings
+                        task, ws, session_id, settings, context=context
                     )
+
+                elif tool_name == "query_memories":
+                    result_text = _execute_query_memories(tool_input.get("query", ""))
 
                 elif tool_name == "run_workflow":
                     wf_id = tool_input.get("workflow_id", "")
                     ctx = tool_input.get("task_context", "")
-                    add_message(session_id, "assistant", f"[Running workflow: {wf_id}]",
-                                metadata={"type": "tool_call", "tool": tool_name, "args": tool_input})
                     result_text = await _execute_run_workflow(
                         wf_id, ctx, ws, session_id, settings
                     )
 
                 elif tool_name == "start_recording":
                     instruction = tool_input.get("instruction", "Please demonstrate the workflow. Click Stop when done.")
-                    add_message(session_id, "assistant", instruction,
-                                metadata={"type": "tool_call", "tool": tool_name, "args": tool_input})
                     recording = await _execute_start_recording(
                         instruction, ws, session_id, queue
                     )
@@ -516,8 +614,6 @@ async def _run_orchestrator_anthropic(
                     result_text = f"Recording received with {event_count} events. Call start_planning to process it into a workflow."
 
                 elif tool_name == "start_planning":
-                    add_message(session_id, "assistant", "[Processing recording into workflow...]",
-                                metadata={"type": "tool_call", "tool": tool_name})
                     if last_recording:
                         result_text = await _execute_start_planning(
                             last_recording, ws, session_id, settings, planning_queues
@@ -533,11 +629,20 @@ async def _run_orchestrator_anthropic(
                 elif tool_name == "save_as_workflow":
                     wf_name = tool_input.get("name", "workflow")
                     wf_desc = tool_input.get("description", "")
-                    add_message(session_id, "assistant", f"[Saving session as workflow: {wf_name}]",
-                                metadata={"type": "tool_call", "tool": tool_name, "args": tool_input})
                     result_text = await _execute_save_as_workflow(
                         wf_name, wf_desc, ws, session_id, settings, planning_queues
                     )
+
+                elif tool_name == "store_memory":
+                    mem_type = tool_input.get("type", "procedural")
+                    content = tool_input.get("content", "")
+                    priority = int(tool_input.get("priority", 0))
+                    result_text = _execute_store_memory(mem_type, content, priority)
+                    print(f"[memory] store_memory called: type={mem_type} priority={priority} content={content[:100]!r}")
+
+                else:
+                    result_text = f"Unknown tool: {tool_name}"
+                    print(f"[orchestrator] WARNING: unhandled tool call: {tool_name}")
 
                 tool_results.append(
                     {
@@ -550,7 +655,9 @@ async def _run_orchestrator_anthropic(
         if tool_results:
             messages.append({"role": "user", "content": tool_results})
         elif response.stop_reason == "end_turn":
-            # No tool calls, wait for next user message
+            # Signal frontend that orchestrator is idle — clears stop button
+            await _safe_send(ws, {"type": "orchestrator_ready", "session_id": session_id})
+            # Wait for next user message
             user_msg = await queue.get()
             if isinstance(user_msg, dict) and user_msg.get("type") == "recording":
                 # Recording arrived without start_recording tool call (edge case)
@@ -617,27 +724,35 @@ async def _run_orchestrator_openai(
 
                 result_text = ""
 
+                # Emit tool call to frontend and persist for all tools
+                add_message(session_id, "assistant", f"[{tool_name}]",
+                            metadata={"type": "tool_call", "tool": tool_name, "args": tool_input})
+                await _safe_send(ws, {
+                    "type": "tool_call_start",
+                    "session_id": session_id,
+                    "tool": tool_name,
+                    "args": tool_input,
+                })
+
                 if tool_name == "run_browser_agent":
                     task = tool_input.get("task", "")
-                    add_message(session_id, "assistant", f"[Running browser agent: {task[:200]}]",
-                                metadata={"type": "tool_call", "tool": tool_name, "args": tool_input})
+                    context = tool_input.get("context") or None
                     result_text = await _execute_run_browser_agent(
-                        task, ws, session_id, settings
+                        task, ws, session_id, settings, context=context
                     )
+
+                elif tool_name == "query_memories":
+                    result_text = _execute_query_memories(tool_input.get("query", ""))
 
                 elif tool_name == "run_workflow":
                     wf_id = tool_input.get("workflow_id", "")
                     ctx = tool_input.get("task_context", "")
-                    add_message(session_id, "assistant", f"[Running workflow: {wf_id}]",
-                                metadata={"type": "tool_call", "tool": tool_name, "args": tool_input})
                     result_text = await _execute_run_workflow(
                         wf_id, ctx, ws, session_id, settings
                     )
 
                 elif tool_name == "start_recording":
                     instruction = tool_input.get("instruction", "Please demonstrate the workflow. Click Stop when done.")
-                    add_message(session_id, "assistant", instruction,
-                                metadata={"type": "tool_call", "tool": tool_name, "args": tool_input})
                     recording = await _execute_start_recording(
                         instruction, ws, session_id, queue
                     )
@@ -646,8 +761,6 @@ async def _run_orchestrator_openai(
                     result_text = f"Recording received with {event_count} events. Call start_planning to process it into a workflow."
 
                 elif tool_name == "start_planning":
-                    add_message(session_id, "assistant", "[Processing recording into workflow...]",
-                                metadata={"type": "tool_call", "tool": tool_name})
                     if last_recording:
                         result_text = await _execute_start_planning(
                             last_recording, ws, session_id, settings, planning_queues
@@ -663,11 +776,20 @@ async def _run_orchestrator_openai(
                 elif tool_name == "save_as_workflow":
                     wf_name = tool_input.get("name", "workflow")
                     wf_desc = tool_input.get("description", "")
-                    add_message(session_id, "assistant", f"[Saving session as workflow: {wf_name}]",
-                                metadata={"type": "tool_call", "tool": tool_name, "args": tool_input})
                     result_text = await _execute_save_as_workflow(
                         wf_name, wf_desc, ws, session_id, settings, planning_queues
                     )
+
+                elif tool_name == "store_memory":
+                    mem_type = tool_input.get("type", "procedural")
+                    content = tool_input.get("content", "")
+                    priority = int(tool_input.get("priority", 0))
+                    result_text = _execute_store_memory(mem_type, content, priority)
+                    print(f"[memory] store_memory called: type={mem_type} priority={priority} content={content[:100]!r}")
+
+                else:
+                    result_text = f"Unknown tool: {tool_name}"
+                    print(f"[orchestrator] WARNING: unhandled tool call: {tool_name}")
 
                 openai_messages.append(
                     {
@@ -677,6 +799,9 @@ async def _run_orchestrator_openai(
                     }
                 )
         elif choice.finish_reason == "stop":
+            # Signal frontend that orchestrator is idle — clears stop button
+            await _safe_send(ws, {"type": "orchestrator_ready", "session_id": session_id})
+            # Wait for next user message
             user_msg = await queue.get()
             if isinstance(user_msg, dict) and user_msg.get("type") == "recording":
                 last_recording = user_msg.get("data", {})
@@ -696,7 +821,7 @@ async def _run_orchestrator_openai(
 
 def _build_orchestrator_context() -> str:
     """Build context string for the orchestrator system prompt."""
-    from db import get_identity_text, get_memory_text
+    from db import get_identity_text
     from hooks import load_workflows_text
     from workflow_utils import list_workflows
 
@@ -704,9 +829,6 @@ def _build_orchestrator_context() -> str:
     identity = get_identity_text()
     if identity:
         parts.append(f"\n\nIdentity:\n{identity}")
-    memory = get_memory_text()
-    if memory:
-        parts.append(f"\n\nMemory:\n{memory}")
 
     # Include workflow index so the orchestrator knows exact IDs
     wf_list = list_workflows()

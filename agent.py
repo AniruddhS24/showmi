@@ -3,9 +3,8 @@ from browser_use.browser.profile import BrowserProfile
 from browser_use.llm.openai.chat import ChatOpenAI
 
 from config import _parse_use_vision, config
-from db import get_identity_text, get_memory_text
+from db import get_identity_text
 from hooks import load_workflows_text, on_step_end, on_step_start
-
 
 def _make_browser(cfg=None) -> Browser:
     """Create a Browser instance, using CDP if configured or launching with profile."""
@@ -23,14 +22,11 @@ def _make_browser(cfg=None) -> Browser:
 
 
 def _build_system_message() -> str | None:
-    """Combine identity, memory, and workflows into a single system message extension."""
+    """Combine identity and workflows into a system message extension."""
     parts = []
     identity = get_identity_text()
     if identity:
         parts.append(identity)
-    memory = get_memory_text()
-    if memory:
-        parts.append(memory)
     workflows = load_workflows_text()
     if workflows:
         parts.append(workflows)
