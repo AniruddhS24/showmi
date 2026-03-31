@@ -42,6 +42,12 @@ const logsClose = document.getElementById("logs-close");
 const logsClear = document.getElementById("logs-clear");
 const logsOutput = document.getElementById("logs-output");
 
+// Memory drawer
+const memoryBtn = document.getElementById("memory-btn");
+const memoryDrawer = document.getElementById("memory-drawer");
+const memoryClose = document.getElementById("memory-close");
+const memoryList = document.getElementById("memory-list");
+
 // Workflows drawer
 const workflowsBtn = document.getElementById("workflows-btn");
 const workflowsDrawer = document.getElementById("workflows-drawer");
@@ -57,12 +63,33 @@ const tabContextBadge = document.getElementById("tab-context-badge");
 const tabContextUrl = document.getElementById("tab-context-url");
 const tabContextRemove = document.getElementById("tab-context-remove");
 
+// ── Provider helpers ──
+const PROVIDER_BASE_URLS = {
+  anthropic: "https://api.anthropic.com",
+  openai: "https://api.openai.com/v1",
+  local: "",
+};
+const KNOWN_BASE_URLS = new Set(Object.values(PROVIDER_BASE_URLS).filter(Boolean));
+
+function getProviderIconSVG(provider, size = 13) {
+  if (provider === "anthropic") {
+    // Official Anthropic brand mark
+    return `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="#c96442" xmlns="http://www.w3.org/2000/svg"><path d="M14.06 3.74L20.78 17h-4.03l-1.51-3.26H8.76L7.25 17H3.22l6.72-13.26h4.12zm-2.06 3.2L9.69 11.2h4.62L12 6.94z"/></svg>`;
+  } else if (provider === "openai") {
+    // Official OpenAI bloom mark
+    return `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="#10a37f" xmlns="http://www.w3.org/2000/svg"><path d="M22.28 9.82a5.98 5.98 0 0 0-.52-4.91 6.05 6.05 0 0 0-6.51-2.9A6.07 6.07 0 0 0 4.98 4.18a5.98 5.98 0 0 0-4 2.9 6.05 6.05 0 0 0 .74 7.1 5.98 5.98 0 0 0 .51 4.91 6.05 6.05 0 0 0 6.52 2.9A5.98 5.98 0 0 0 13.26 24a6.06 6.06 0 0 0 5.77-4.21 5.99 5.99 0 0 0 4-2.9 6.06 6.06 0 0 0-.75-7.07zM13.26 22.43a4.48 4.48 0 0 1-2.88-1.04l.14-.08 4.78-2.76a.8.8 0 0 0 .4-.68v-6.74l2.02 1.17a.07.07 0 0 1 .04.05v5.58a4.5 4.5 0 0 1-4.5 4.5zM3.6 18.3a4.47 4.47 0 0 1-.54-3.01l.14.08 4.78 2.76a.77.77 0 0 0 .78 0l5.84-3.37v2.33a.08.08 0 0 1-.03.06l-4.82 2.79A4.5 4.5 0 0 1 3.6 18.3zM2.34 7.9a4.49 4.49 0 0 1 2.37-1.97v5.67a.77.77 0 0 0 .39.68l5.81 3.36-2.02 1.17a.08.08 0 0 1-.07 0L4 14.1A4.51 4.51 0 0 1 2.34 7.9zm16.6 3.86-5.85-3.39 2.02-1.17a.08.08 0 0 1 .07 0l4.82 2.78a4.5 4.5 0 0 1-.7 8.12V12.4a.8.8 0 0 0-.37-.66zm2.01-3.02-.14-.09-4.77-2.78a.78.78 0 0 0-.79 0L9.41 9.23V6.9a.07.07 0 0 1 .03-.06l4.81-2.77a4.5 4.5 0 0 1 6.68 4.67zM8.48 12.86l-2.02-1.16a.08.08 0 0 1-.04-.06V6.08a4.5 4.5 0 0 1 7.38-3.45l-.14.08-4.78 2.76a.8.8 0 0 0-.4.68v6.71zm1.1-2.36 2.6-1.5 2.61 1.5v3l-2.6 1.5-2.61-1.5z"/></svg>`;
+  } else {
+    return `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>`;
+  }
+}
+
 // ── State ──
 let ws = null;
 let reconnectDelay = 1000;
 const MAX_RECONNECT_DELAY = 30000;
 let failedConnections = 0;
 let currentSessionId = null;
+let sessions = [];
 let models = [];
 let editingModelId = null;
 let attachedTab = null; // { url, title } or null if user dismissed
@@ -104,6 +131,7 @@ function startNewChat() {
   messagesEl.appendChild(emptyStateEl);
   emptyStateEl.style.display = "";
   currentSessionId = null;
+  setChatTitle("");
   updateInputState();
   refreshTabContext();
 }
@@ -121,11 +149,17 @@ chatsClose.addEventListener("click", () => {
 async function loadChats() {
   try {
     const res = await fetch(`${API_BASE}/api/sessions`);
-    const sessions = await res.json();
+    sessions = await res.json();
     renderChats(sessions);
   } catch {
+    sessions = [];
     chatsList.innerHTML = '<div class="no-chats">could not load chats</div>';
   }
+}
+
+function setChatTitle(title) {
+  const el = document.getElementById("chat-title");
+  if (el) el.textContent = title || "";
 }
 
 async function deleteChat(sessionId) {
@@ -193,6 +227,8 @@ async function loadChat(sessionId) {
     messagesEl.innerHTML = "";
     emptyStateEl.style.display = "none";
     currentSessionId = sessionId;
+    const session = sessions.find((s) => s.id === sessionId);
+    setChatTitle(session ? session.title : "");
 
     // Check if this session has an active agent
     const state = getSessionState(sessionId);
@@ -213,6 +249,8 @@ async function loadChat(sessionId) {
           stepTraceEl = null;
         } else if (meta.type === "workflow_proposal") {
           renderWorkflowProposal(meta.workflow_markdown || msg.content, meta.manifest_yaml);
+        } else if (meta.type === "tool_call") {
+          addToolCallPill(meta.tool, meta.args || {});
         } else {
           addMessage("agent", msg.content);
         }
@@ -356,6 +394,8 @@ async function fetchModels() {
 function updateModelBadge() {
   const active = models.find((m) => m.is_active);
   modelBadgeName.textContent = active ? (active.name || active.model || "untitled") : "no model";
+  const iconEl = document.getElementById("model-badge-icon");
+  if (iconEl) iconEl.innerHTML = active ? getProviderIconSVG(active.provider, 11) : "";
 }
 
 // ── Models overlay ──
@@ -433,15 +473,26 @@ function openEditor(m) {
   editingModelId = m ? m.id : null;
   editorTitle.textContent = m ? "edit model" : "new model";
   document.getElementById("edit-name").value = m ? m.name : "";
-  document.getElementById("edit-provider").value = m ? m.provider : "anthropic";
+  const provider = m ? m.provider : "anthropic";
+  document.getElementById("edit-provider").value = provider;
   document.getElementById("edit-api-key").value = "";
   document.getElementById("edit-api-key").type = "password";
   document.getElementById("edit-api-key").placeholder = m ? (m.api_key_preview || "sk-...") : "sk-...";
-  document.getElementById("edit-base-url").value = m ? m.base_url : "";
+  const existingUrl = m ? (m.base_url || "") : "";
+  document.getElementById("edit-base-url").value =
+    !m ? (PROVIDER_BASE_URLS[provider] || "") :
+    (KNOWN_BASE_URLS.has(existingUrl) || !existingUrl) ? (PROVIDER_BASE_URLS[provider] || "") : existingUrl;
   document.getElementById("edit-model").value = m ? m.model : "";
   document.getElementById("edit-temperature").value = m ? m.temperature : 0.5;
   tempValue.textContent = m ? m.temperature : 0.5;
+  updateProviderIcon();
   modelEditor.classList.remove("hidden");
+}
+
+function updateProviderIcon() {
+  const provider = document.getElementById("edit-provider").value;
+  const iconEl = document.getElementById("provider-icon");
+  if (iconEl) iconEl.innerHTML = getProviderIconSVG(provider);
 }
 
 function hideEditor() {
@@ -487,6 +538,15 @@ tempSlider.addEventListener("input", () => {
   tempValue.textContent = tempSlider.value;
 });
 
+document.getElementById("edit-provider").addEventListener("change", () => {
+  const provider = document.getElementById("edit-provider").value;
+  const currentUrl = document.getElementById("edit-base-url").value.trim();
+  if (!currentUrl || KNOWN_BASE_URLS.has(currentUrl)) {
+    document.getElementById("edit-base-url").value = PROVIDER_BASE_URLS[provider] || "";
+  }
+  updateProviderIcon();
+});
+
 // Toggle password visibility
 document.querySelector(".toggle-visibility").addEventListener("click", () => {
   const input = document.getElementById("edit-api-key");
@@ -529,7 +589,10 @@ function connect() {
     setStatus("disconnected");
     ws = null;
     failedConnections++;
-    updateSendState();
+    // Server cancels all tasks on disconnect — mirror that on the frontend
+    Object.values(sessionStates).forEach((s) => { s.isWorking = false; });
+    removeThinking();
+    updateInputState();
     if (failedConnections >= 2) {
       showDisconnectedBanner();
     }
@@ -635,10 +698,25 @@ function handleServerMessage(data) {
       break;
     }
 
+    case "tool_call_start":
+      addToolCallPill(data.tool, data.args || {});
+      break;
+
     case "orchestrator_message":
       removeThinking();
       addMessage("agent", data.content || "");
       break;
+
+    case "orchestrator_ready": {
+      // Orchestrator is idle, waiting for next user message
+      const state = getSessionState(msgSessionId);
+      state.isWorking = false;
+      if (msgSessionId === currentSessionId) {
+        removeThinking();
+        updateInputState();
+      }
+      break;
+    }
 
     case "orchestrator_command":
       if (data.command === "start_recording") {
@@ -680,8 +758,6 @@ function handleServerMessage(data) {
     case "planning_complete":
       removeThinking();
       exitPlanningMode();
-      if (planningApprove) { planningApprove.disabled = false; planningApprove.textContent = "approve"; }
-      if (planningTest) { planningTest.disabled = false; planningTest.textContent = "test"; }
       addMessage("system", data.workflow_id ? `Workflow saved: ${data.workflow_id}` : "Workflow discarded.");
       break;
 
@@ -1042,6 +1118,131 @@ function cancelTask() {
   sendBtn.disabled = true;
 }
 
+// ── Tool call pill (inline in chat) ──
+const TOOL_LABELS = {
+  run_browser_agent: "browser agent",
+  run_workflow:      "run workflow",
+  search_workflows:  "search workflows",
+  start_recording:   "recording",
+  start_planning:    "planning",
+  save_as_workflow:  "save workflow",
+  store_memory:      "memory",
+  query_memories:    "recall memories",
+};
+
+const TOOL_ICONS = {
+  run_browser_agent: "⚡",
+  run_workflow:      "▶",
+  search_workflows:  "◎",
+  start_recording:   "⏺",
+  start_planning:    "⚙",
+  save_as_workflow:  "◈",
+  store_memory:      "◆",
+  query_memories:    "◈",
+};
+
+function addToolCallPill(toolName, args) {
+  // retrieve_memories: show each injected memory as a sub-item
+  if (toolName === "retrieve_memories") {
+    const memories = args.memories || [];
+    if (memories.length === 0) return;
+    const TYPE_LABELS = { episodic: "past run", procedural: "how-to", semantic: "fact" };
+    const el = document.createElement("div");
+    el.className = "tool-call-pill memory-context-pill";
+    const items = memories.map((m) =>
+      `<span class="memory-context-item">` +
+        `<span class="memory-context-type">${escapeHtml(TYPE_LABELS[m.type] || m.type)}</span>` +
+        `<span class="memory-context-text">${escapeHtml(m.content)}</span>` +
+      `</span>`
+    ).join("");
+    el.innerHTML =
+      `<span class="tool-call-icon">◈</span>` +
+      `<span class="tool-call-label">context from memory</span>` +
+      `<span class="memory-context-items">${items}</span>`;
+    messagesEl.appendChild(el);
+    scrollToBottom();
+    return;
+  }
+
+  // store_memory gets the special accented memory pill
+  if (toolName === "store_memory") {
+    const type = args.type || "procedural";
+    const content = args.content || "";
+    const priority = args.priority || 0;
+    const typeLabel = { episodic: "past run", procedural: "how-to", semantic: "fact" }[type] || type;
+    const el = document.createElement("div");
+    el.className = "tool-call-pill memory-pill";
+    el.innerHTML =
+      `<span class="tool-call-icon">◆</span>` +
+      `<span class="tool-call-label">${escapeHtml(typeLabel)}</span>` +
+      `<span class="tool-call-detail">${escapeHtml(content)}</span>`;
+    messagesEl.appendChild(el);
+    scrollToBottom();
+    return;
+  }
+
+  // Generic pill for all other tools
+  let detail = "";
+  if (toolName === "run_browser_agent") detail = (args.task || "").substring(0, 100);
+  else if (toolName === "run_workflow")  detail = args.workflow_id || "";
+  else if (toolName === "search_workflows") detail = args.query || "all";
+  else if (toolName === "save_as_workflow") detail = args.name || "";
+  else if (toolName === "start_recording") detail = (args.instruction || "").substring(0, 60);
+
+  const el = document.createElement("div");
+  el.className = "tool-call-pill";
+  el.innerHTML =
+    `<span class="tool-call-icon">${escapeHtml(TOOL_ICONS[toolName] || "●")}</span>` +
+    `<span class="tool-call-label">${escapeHtml(TOOL_LABELS[toolName] || toolName)}</span>` +
+    (detail ? `<span class="tool-call-detail">${escapeHtml(detail)}</span>` : "");
+  messagesEl.appendChild(el);
+  scrollToBottom();
+}
+
+// ── Memory drawer ──
+if (memoryBtn) {
+  memoryBtn.addEventListener("click", () => {
+    memoryDrawer.classList.remove("hidden");
+    loadMemories();
+  });
+}
+
+if (memoryClose) {
+  memoryClose.addEventListener("click", () => {
+    memoryDrawer.classList.add("hidden");
+  });
+}
+
+async function loadMemories() {
+  if (!memoryList) return;
+  memoryList.innerHTML = '<div class="wf-picker-loading">loading...</div>';
+  try {
+    const resp = await fetch(`${API_BASE}/memory`);
+    const data = await resp.json();
+    const entries = data.entries || [];
+    if (!entries.length) {
+      memoryList.innerHTML = '<div class="wf-picker-empty">no memories yet</div>';
+      return;
+    }
+    memoryList.innerHTML = "";
+    for (const m of entries) {
+      const item = document.createElement("div");
+      item.className = "memory-item";
+      const typeLabel = { episodic: "past run", procedural: "how-to", semantic: "fact" }[m.type] || m.type;
+      const date = m.last_used_at ? new Date(m.last_used_at).toLocaleDateString(undefined, { month: "short", day: "numeric" }) : "";
+      item.innerHTML =
+        `<div class="memory-item-header">` +
+          `<span class="memory-item-type ${m.type}">${escapeHtml(typeLabel)}</span>` +
+          `<span class="memory-item-meta">${m.num_uses} uses${date ? " · " + date : ""}</span>` +
+        `</div>` +
+        `<div class="memory-item-content">${escapeHtml(m.content)}</div>`;
+      memoryList.appendChild(item);
+    }
+  } catch {
+    memoryList.innerHTML = '<div class="wf-picker-empty">failed to load memories</div>';
+  }
+}
+
 // ── Workflow picker ──
 // ── Workflows drawer ──
 
@@ -1268,6 +1469,8 @@ function exitPlanningMode() {
   lastProposedManifest = null;
   lastProposedMarkdown = null;
   if (planningBar) planningBar.classList.add("hidden");
+  if (planningApprove) planningApprove._pending = false;
+  if (planningReject) planningReject._pending = false;
   updateInputState();
 }
 
@@ -1377,9 +1580,19 @@ function renderScriptProposal(manifestYaml, scriptCode) {
 // Planning action buttons
 if (planningApprove) {
   planningApprove.addEventListener("click", async () => {
-    if (!lastProposedMarkdown) return;
+    if (planningApprove._pending || !lastProposedMarkdown) return;
+    planningApprove._pending = true;
     planningApprove.disabled = true;
     planningApprove.textContent = "saving...";
+
+    // Signal planning agent first so it can clean up while we save
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({
+        type: "planning_action",
+        session_id: currentSessionId,
+        action: "approve",
+      }));
+    }
 
     // Build file_content with YAML frontmatter
     let fileContent = lastProposedMarkdown;
@@ -1414,35 +1627,28 @@ if (planningApprove) {
           exitPlanningMode();
         } else {
           addMessage("error", updateResult.error || "Failed to save workflow.");
+          exitPlanningMode();
         }
       } else {
         addMessage("error", result.error || "Failed to save workflow.");
+        exitPlanningMode();
       }
     } catch (err) {
       addMessage("error", `Save failed: ${err.message}`);
+      exitPlanningMode();
     }
-
-    planningApprove.disabled = false;
-    planningApprove.textContent = "approve";
-
-    // Signal planning agent to stop (best-effort)
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({
-        type: "planning_action",
-        session_id: currentSessionId,
-        action: "approve",
-      }));
-    }
+    // exitPlanningMode() clears _pending and hides the bar — no explicit re-enable needed
   });
 }
 
 if (planningReject) {
   planningReject.addEventListener("click", () => {
+    if (planningReject._pending) return;
+    planningReject._pending = true;
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: "planning_action", session_id: currentSessionId, action: "reject" }));
     }
-    addMessage("system", "Workflow discarded.");
-    exitPlanningMode();
+    // Let planning_complete event drive exitPlanningMode and "Workflow discarded." message
   });
 }
 
