@@ -1,6 +1,7 @@
-# Showmi
+# Showmi ✨  
+_A “show me” browser agent_
 
-A self-learning browser agent you control from a Chrome sidebar.
+A self-learning browser agent you control from a Chrome sidebar. See [docs](docs/) for an architecture overview and system diagram (one I presented).
 
 ## Install
 
@@ -10,7 +11,7 @@ curl -fsSL https://raw.githubusercontent.com/AniruddhS24/self-learning-browserus
 
 ## Setup
 
-### 1. Configure a model
+### 1. Configure a model (can do this later too)
 
 ```bash
 showmi models add
@@ -23,15 +24,19 @@ showmi models add
 3. Click **Load unpacked**
 4. Select `~/.showmi/repo/extension/`
 
+Hit Cmd+Shift+. to see hidden folders in MacOS Finder.
+
 ### 3. Start the server
 
 ```bash
 showmi start
 ```
 
-Open the Showmi sidebar in Chrome and start chatting!
+This starts the daemon worker that serves the showmi API. To call it, pin the Showmi sidebar in Chrome and start chatting!
 
 ## Commands
+
+Some useful commands to manage server state. `showmi status` and `showmi restart` are useful if any issues, and `showmi logs` tails the server logs.
 
 ```bash
 showmi start          # start the server (background)
