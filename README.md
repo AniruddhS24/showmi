@@ -3,6 +3,13 @@ _A “show me” browser agent_
 
 A self-learning browser agent you control from a Chrome sidebar. See [docs](docs/) for an architecture overview and system diagram (one I presented).
 
+## Prerequisites
+
+- **Python 3.11+** — [python.org](https://www.python.org/downloads/)
+- **Git** — [git-scm.com](https://git-scm.com/)
+- **Google Chrome**
+- **uv** _(optional, faster install)_ — [docs.astral.sh/uv](https://docs.astral.sh/uv/)
+
 ## Install
 
 ```bash
