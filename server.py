@@ -5,45 +5,47 @@ import traceback
 import uvicorn
 import yaml
 from browser_use import Agent
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from starlette.responses import FileResponse, StreamingResponse
 from browser_use.llm.anthropic.chat import ChatAnthropic as BrowserUseChatAnthropic
 from browser_use.llm.openai.chat import ChatOpenAI as BrowserUseChatOpenAI
-from browser_use.llm.views import ChatInvokeCompletion
-from pydantic import BaseModel, ValidationError as PydanticValidationError
+from pydantic import BaseModel
 
 
 class _RobustChatOpenAI(BrowserUseChatOpenAI):
-    """BrowserUseChatOpenAI that tolerates trailing whitespace/newlines in JSON responses.
+    """OpenAI-compatible client that handles local models appending trailing whitespace to JSON.
 
-    Local and proxy models often append a trailing newline after the JSON object,
-    which causes Pydantic's model_validate_json to raise "trailing characters".
-    This subclass retries by stripping the raw content and re-validating.
+    browser-use uses Pydantic's model_validate_json (strict jiter parser) which rejects
+    even a trailing newline. Python's json.loads handles this fine, so we fall back to it.
     """
 
     async def ainvoke(self, messages, output_format=None, **kwargs):
+        if output_format is None:
+            return await super().ainvoke(messages, output_format, **kwargs)
+
+        orig = output_format.model_validate_json
+
+        def _tolerant_validate(json_data, *a, **kw):
+            try:
+                return orig(json_data, *a, **kw)
+            except Exception:
+                return output_format.model_validate(json.loads(json_data))
+
+        output_format.model_validate_json = _tolerant_validate
         try:
             return await super().ainvoke(messages, output_format, **kwargs)
-        except PydanticValidationError as exc:
-            if output_format is None or "trailing" not in str(exc).lower():
-                raise
-            # Get raw string response (no structured output enforcement) and strip it
-            raw = await super().ainvoke(messages, None, **kwargs)
-            try:
-                parsed = output_format.model_validate_json(raw.completion.strip())
-                return ChatInvokeCompletion(
-                    completion=parsed, usage=raw.usage, stop_reason=raw.stop_reason
-                )
-            except Exception:
-                raise exc
+        finally:
+            output_format.model_validate_json = orig
 
 from agent import _make_browser
-from config import config as default_config
+from config import DEFAULT_EXTRACTION_MODEL, config as default_config
 from planning import run_planning_agent
 from db import (
     add_message,
     create_session,
+    CHATS_DIR,
     get_context_summary,
     get_identity_text,
     get_session_messages,
@@ -80,14 +82,6 @@ app.add_middleware(
 )
 
 
-# ── Log streaming ──
-# Tail the persistent log file at ~/.showmi/logs/server.log for the /ws/logs endpoint.
-
-import re as _re
-
-_ANSI_RE = _re.compile(r"\x1b\[[0-9;]*m")
-
-
 @app.on_event("startup")
 async def startup():
     init_db()
@@ -96,42 +90,6 @@ async def startup():
 @app.get("/health")
 async def health():
     return {"status": "ok"}
-
-
-@app.websocket("/ws/logs")
-async def websocket_logs(ws: WebSocket):
-    """Tail ~/.showmi/logs/server.log and stream to the client."""
-    from db import LOGS_DIR
-
-    await ws.accept()
-    log_path = LOGS_DIR / "server.log"
-
-    try:
-        if not log_path.exists():
-            await ws.send_text("(no log file yet — start server with `showmi start`)")
-            # Wait for file to appear
-            while not log_path.exists():
-                await asyncio.sleep(1)
-
-        with open(log_path, "r") as f:
-            # Send last 200 lines as backlog
-            lines = f.readlines()
-            for line in lines[-200:]:
-                clean = _ANSI_RE.sub("", line.rstrip())
-                if clean:
-                    await ws.send_text(clean)
-
-            # Tail new lines
-            while True:
-                line = f.readline()
-                if line:
-                    clean = _ANSI_RE.sub("", line.rstrip())
-                    if clean:
-                        await ws.send_text(clean)
-                else:
-                    await asyncio.sleep(0.3)
-    except Exception:
-        pass
 
 
 # ── REST: Sessions ──
@@ -164,15 +122,16 @@ class ModelPayload(BaseModel):
     temperature: float = 0.5
 
 
+def _mask_api_key(model_dict: dict) -> dict:
+    """Replace api_key with a masked preview in a model dict."""
+    key = model_dict.pop("api_key", "")
+    model_dict["api_key_preview"] = ("..." + key[-4:]) if len(key) > 4 else ("*" * len(key))
+    return model_dict
+
+
 @app.get("/api/models")
 async def api_list_models():
-    models = list_models()
-    # Mask API keys in response (show last 4 chars only)
-    for m in models:
-        key = m.get("api_key", "")
-        m["api_key_preview"] = ("..." + key[-4:]) if len(key) > 4 else ("*" * len(key))
-        del m["api_key"]
-    return models
+    return [_mask_api_key(m) for m in list_models()]
 
 
 @app.get("/api/models/active")
@@ -180,10 +139,7 @@ async def api_active_model():
     m = get_active_model()
     if not m:
         return JSONResponse(status_code=404, content={"error": "No active model"})
-    key = m.get("api_key", "")
-    m["api_key_preview"] = ("..." + key[-4:]) if len(key) > 4 else ("*" * len(key))
-    del m["api_key"]
-    return m
+    return _mask_api_key(m)
 
 
 @app.post("/api/models")
@@ -235,6 +191,13 @@ async def get_identity():
 @app.get("/memory")
 async def get_memory():
     return {"entries": list_memories()}
+
+
+@app.delete("/memory/{memory_id}")
+async def remove_memory(memory_id: int):
+    from db import delete_memory
+    delete_memory(memory_id)
+    return {"ok": True}
 
 
 # ── REST: Workflow CRUD & Compilation ──
@@ -359,35 +322,22 @@ def compress_chat_context(session_id: str, step_number: int) -> None:
     save_context_summary(session_id, "\n".join(summary_lines) + "\n")
 
 
-# ── WebSocket step hooks ──
+# ── Step hooks (push to SSE event bus) ──
 
 
-def _make_step_hook(ws: WebSocket, session_id: str):
-    """Create on_step_start and on_step_end hooks that stream updates via WebSocket."""
+def _make_step_hook(event_bus: asyncio.Queue, session_id: str):
+    """Create on_step_start and on_step_end hooks that push events to the SSE bus."""
 
     async def on_step_start(agent) -> None:
         step = agent.state.n_steps
         model_output = agent.state.last_model_output
+        goal = model_output.next_goal if model_output and model_output.next_goal else None
 
-        goal = None
-        if model_output and model_output.next_goal:
-            goal = model_output.next_goal
-
-        msg = {
-            "type": "step",
-            "session_id": session_id,
-            "step_number": step,
-            "goal": goal,
-            "phase": "start",
-        }
-        try:
-            await ws.send_json(msg)
-        except Exception:
-            pass
-
-        print(f"\n{'='*60}")
-        print(f"Step {step}")
-        print(f"{'='*60}")
+        await event_bus.put({
+            "type": "step", "session_id": session_id,
+            "step_number": step, "goal": goal, "phase": "start",
+        })
+        print(f"\n{'='*60}\nStep {step}\n{'='*60}")
         if goal:
             print(f"Goal: {goal}")
 
@@ -399,17 +349,16 @@ def _make_step_hook(ws: WebSocket, session_id: str):
         action_names = []
         if model_output and model_output.action:
             for action in model_output.action:
-                action_data = action.model_dump(exclude_none=True)
-                action_names.append(action_data)
+                action_names.append(action.model_dump(exclude_none=True))
 
         for i, r in enumerate(results):
-            action_label = str(action_names[i]) if i < len(action_names) else "action"
+            label = str(action_names[i]) if i < len(action_names) else "action"
             if r.error:
-                print(f"  [error] {action_label} — {r.error}")
+                print(f"  [error] {label} — {r.error}")
             elif r.is_done:
-                print(f"  [done] {action_label}")
+                print(f"  [done] {label}")
             else:
-                print(f"  [ok] {action_label}")
+                print(f"  [ok] {label}")
             if r.extracted_content:
                 print(f"         → {r.extracted_content[:150]}")
 
@@ -420,35 +369,19 @@ def _make_step_hook(ws: WebSocket, session_id: str):
             pass
         print(f"URL: {url}")
 
-        actions = []
-        for i, r in enumerate(results):
-            actions.append({
-                "action": action_names[i] if i < len(action_names) else None,
-                "error": r.error,
-                "is_done": r.is_done,
-                "extracted": r.extracted_content,
-            })
+        actions = [{
+            "action": action_names[i] if i < len(action_names) else None,
+            "error": r.error, "is_done": r.is_done, "extracted": r.extracted_content,
+        } for i, r in enumerate(results)]
 
-        goal = None
-        if model_output and model_output.next_goal:
-            goal = model_output.next_goal
-
+        goal = model_output.next_goal if model_output and model_output.next_goal else None
         msg = {
-            "type": "step",
-            "session_id": session_id,
-            "step_number": step,
-            "goal": goal,
-            "actions": actions,
-            "url": url,
+            "type": "step", "session_id": session_id, "step_number": step,
+            "goal": goal, "actions": actions, "url": url,
         }
-        try:
-            await ws.send_json(msg)
-        except Exception:
-            pass
-
+        await event_bus.put(msg)
         add_message(session_id, "assistant", json.dumps(msg), metadata=msg)
 
-        # Context compression every N steps
         if step > 0 and step % COMPRESSION_INTERVAL == 0:
             compress_chat_context(session_id, step)
 
@@ -457,8 +390,16 @@ def _make_step_hook(ws: WebSocket, session_id: str):
 
 
 
-async def run_agent_ws(task: str, ws: WebSocket, session_id: str, settings: dict, agent_overrides: dict | None = None) -> None:
-    """Run the browser-use agent, streaming updates over a WebSocket."""
+SPEED_PROMPT = """\
+Speed optimization instructions:
+- Be direct — get to the goal as quickly as possible
+- Use multi-action sequences to reduce steps
+- Don't over-verify — trust that actions succeeded unless you see an error
+- Skip unnecessary scrolling or waiting"""
+
+
+async def run_agent(task: str, event_bus: asyncio.Queue, session_id: str, settings: dict, agent_overrides: dict | None = None) -> str:
+    """Run the browser-use agent, streaming step events to the SSE bus."""
 
     cfg = default_config
     provider = settings.get("provider", "local")
@@ -471,8 +412,7 @@ async def run_agent_ws(task: str, ws: WebSocket, session_id: str, settings: dict
     if settings.get("temperature") is not None:
         object.__setattr__(cfg, "llm_temperature", float(settings["temperature"]))
 
-    print(f"Task: {task}")
-    print(f"Provider: {provider}, Model: {cfg.llm_model}")
+    print(f"Task: {task}\nProvider: {provider}, Model: {cfg.llm_model}")
 
     browser = _make_browser(cfg)
 
@@ -490,35 +430,47 @@ async def run_agent_ws(task: str, ws: WebSocket, session_id: str, settings: dict
             api_key=cfg.llm_api_key,
         )
 
-    on_step_start, on_step_end = _make_step_hook(ws, session_id)
+    on_step_start, on_step_end = _make_step_hook(event_bus, session_id)
 
     from config import _parse_use_vision
+    from pathlib import Path
+
+    gif_dir = CHATS_DIR / session_id
+    gif_dir.mkdir(parents=True, exist_ok=True)
+    gif_path = str(gif_dir / "replay.gif")
 
     agent_kwargs = {
-        "task": task,
-        "llm": llm,
-        "browser": browser,
+        "task": task, "llm": llm, "browser": browser,
         "max_actions_per_step": cfg.max_actions_per_step,
         "max_failures": cfg.max_failures,
         "use_vision": _parse_use_vision(cfg.use_vision),
-        "flash_mode": cfg.flash_mode,
-        "use_thinking": cfg.use_thinking,
+        "flash_mode": cfg.flash_mode, "use_thinking": cfg.use_thinking,
         "vision_detail_level": cfg.vision_detail_level,
         "max_history_items": cfg.max_history_items or None,
+        "extend_system_message": SPEED_PROMPT,
+        "generate_gif": gif_path,
     }
     if provider != "anthropic":
         agent_kwargs["page_extraction_llm"] = BrowserUseChatOpenAI(
-            base_url=cfg.llm_base_url,
-            model="gpt-4o-mini",
-            temperature=0.0,
-            api_key=cfg.llm_api_key,
+            base_url=cfg.llm_base_url, model=DEFAULT_EXTRACTION_MODEL,
+            temperature=0.0, api_key=cfg.llm_api_key,
         )
     if agent_overrides:
         agent_kwargs.update(agent_overrides)
-    agent = Agent(**agent_kwargs)
 
+    agent = Agent(**agent_kwargs)
     print("Running agent...\n")
     update_session_status(session_id, "running")
+
+    start_url = settings.get("start_url")
+    if start_url:
+        try:
+            browser_context = await browser.get_browser_context()
+            pages = browser_context.pages
+            page = pages[0] if pages else await browser_context.new_page()
+            await page.goto(start_url, wait_until="domcontentloaded", timeout=10000)
+        except Exception as e:
+            print(f"Failed to navigate to start URL: {e}")
 
     history = await agent.run(
         max_steps=cfg.max_steps,
@@ -526,301 +478,308 @@ async def run_agent_ws(task: str, ws: WebSocket, session_id: str, settings: dict
         on_step_end=on_step_end,
     )
 
-    # Final context compression at session end
     compress_chat_context(session_id, len(history.history))
 
-    # Collect error strings, filtering out None/empty
     raw_errors = history.errors() or []
     error_strings = [str(e) for e in raw_errors if e is not None and str(e).strip().lower() not in ("", "none")]
 
-    # Build and send final result
+    gif_available = Path(gif_path).exists()
     result_msg = {
-        "type": "result",
-        "session_id": session_id,
+        "type": "result", "session_id": session_id,
         "summary": history.final_result() or "",
-        "steps_taken": len(history.history),
-        "errors": error_strings,
+        "steps_taken": len(history.history), "errors": error_strings,
     }
-    await ws.send_json(result_msg)
-
-    add_message(
-        session_id,
-        "assistant",
-        result_msg["summary"],
-        metadata=result_msg,
-    )
-
-    # Mark completed — the agent finished successfully even if some steps had errors
+    if gif_available:
+        result_msg["gif_url"] = f"/api/sessions/{session_id}/replay.gif"
+    await event_bus.put(result_msg)
+    add_message(session_id, "assistant", result_msg["summary"], metadata=result_msg)
     update_session_status(session_id, "completed")
 
     result_summary = result_msg["summary"] or f"Completed in {len(history.history)} steps."
-
-    print(f"\n{'='*60}")
-    print("Agent finished")
-    print(f"{'='*60}")
-    print(f"Steps taken: {len(history.history)}")
-    if history.final_result():
-        print(f"Result: {history.final_result()}")
-    if error_strings:
-        print(f"Errors: {error_strings}")
-
-
+    print(f"\n{'='*60}\nAgent finished — {len(history.history)} steps\n{'='*60}")
     return result_summary
 
 
-# ── Track running tasks per WebSocket ──
-_running_tasks: dict[str, asyncio.Task] = {}
-_planning_queues: dict[str, asyncio.Queue] = {}
-_orchestrator_queues: dict[str, asyncio.Queue] = {}
+# ── Session runtime (replaces WebSocket state) ──
+
+
+class SessionRuntime:
+    """Runtime state for a session with a running orchestrator."""
+
+    def __init__(self, session_id: str):
+        self.session_id = session_id
+        self.events: asyncio.Queue = asyncio.Queue()  # SSE reads from here
+        self.orch_queue: asyncio.Queue = asyncio.Queue()  # user messages → orchestrator
+        self.planning_queue: asyncio.Queue | None = None  # planning responses
+        self.task: asyncio.Task | None = None
+
+
+_runtimes: dict[str, SessionRuntime] = {}
+
+
+def _get_runtime(session_id: str) -> SessionRuntime:
+    if session_id not in _runtimes:
+        _runtimes[session_id] = SessionRuntime(session_id)
+    return _runtimes[session_id]
 
 
 def _generate_title(content: str) -> str:
-    """Generate a concise title from the user's message."""
-    # Simple heuristic: take first sentence, truncate to 60 chars
     text = content.strip().split("\n")[0]
-    # Remove common prefixes
     for prefix in ["can you ", "could you ", "please ", "i want to ", "i need to "]:
         if text.lower().startswith(prefix):
             text = text[len(prefix):]
             break
-    # Capitalize first letter
     if text:
         text = text[0].upper() + text[1:]
-    # Truncate
     if len(text) > 60:
         text = text[:57] + "..."
     return text or "New chat"
 
 
-def _resolve_settings(data_settings: dict | None = None) -> dict:
-    """Resolve LLM settings from provided data or active model in DB."""
-    settings = data_settings or {}
+def _resolve_settings() -> dict:
+    active = get_active_model()
+    if active:
+        return {
+            "provider": active["provider"],
+            "model": active["model"],
+            "base_url": active["base_url"],
+            "api_key": active["api_key"],
+            "temperature": active["temperature"],
+        }
+    return {}
+
+
+# ── SSE: event stream per session ──
+
+
+@app.get("/api/sessions/{session_id}/events")
+async def session_events(session_id: str):
+    """Server-Sent Events stream for a session. Replaces the WebSocket."""
+    rt = _get_runtime(session_id)
+
+    async def generate():
+        try:
+            while True:
+                event = await rt.events.get()
+                yield f"data: {json.dumps(event)}\n\n"
+        except asyncio.CancelledError:
+            pass
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+# ── REST: Chat (send message / start orchestrator) ──
+
+
+class ChatRequest(BaseModel):
+    content: str
+    session_id: str | None = None
+    active_tab: dict | None = None
+    flash_mode: bool = True
+
+
+@app.post("/api/chat")
+async def api_chat(req: ChatRequest):
+    from orchestrator import run_orchestrator
+
+    settings = _resolve_settings()
+    settings["flash_mode"] = req.flash_mode
     if not settings.get("api_key"):
-        active = get_active_model()
-        if active:
-            settings = {
-                "provider": active["provider"],
-                "model": active["model"],
-                "base_url": active["base_url"],
-                "api_key": active["api_key"],
-                "temperature": active["temperature"],
-            }
-    return settings
+        return JSONResponse(status_code=400, content={"error": "No active model configured."})
+    if not req.content:
+        return JSONResponse(status_code=400, content={"error": "Empty message"})
 
+    if req.session_id:
+        session_id = req.session_id
+    else:
+        session_id = create_session(title=_generate_title(req.content))
 
-@app.websocket("/ws")
-async def websocket_endpoint(ws: WebSocket):
-    await ws.accept()
-    try:
-        while True:
-            raw = await ws.receive_text()
+    add_message(session_id, "user", req.content)
+
+    user_content = req.content
+    if req.active_tab and req.active_tab.get("url"):
+        user_content = f"[User is currently on: {req.active_tab['url']} — \"{req.active_tab.get('title', '')}\"]\n\n{req.content}"
+        settings["start_url"] = req.active_tab["url"]
+
+    rt = _get_runtime(session_id)
+
+    if rt.task and not rt.task.done():
+        # Orchestrator already running — feed message into its queue
+        await rt.orch_queue.put(user_content)
+    else:
+        # Start new orchestrator
+        rt.orch_queue = asyncio.Queue()
+        await rt.orch_queue.put(user_content)
+
+        async def _run(sid, s, queue, runtime):
             try:
-                data = json.loads(raw)
-            except json.JSONDecodeError:
-                await ws.send_json({"type": "error", "message": "Invalid JSON"})
-                continue
+                await run_orchestrator(runtime.events, sid, s, queue, runtime)
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                print(f"Orchestrator error: {traceback.format_exc()}")
+                try:
+                    await runtime.events.put({"type": "error", "session_id": sid, "message": str(e)})
+                except Exception:
+                    pass
 
-            msg_type = data.get("type")
+        rt.task = asyncio.create_task(_run(session_id, settings, rt.orch_queue, rt))
 
-            # ── Planning: user response to agent question ──
-            if msg_type == "planning_response":
-                sid = data.get("session_id", "")
-                content = data.get("content", "")
-                if sid and content:
-                    add_message(sid, "user", content)
-                q = _planning_queues.get(sid)
-                if q:
-                    await q.put(content)
-                continue
+    return {
+        "session_id": session_id,
+        "title": _generate_title(req.content) if not req.session_id else None,
+    }
 
-            # ── Planning: approve / reject / test ──
-            if msg_type == "planning_action":
-                sid = data.get("session_id", "")
-                action = data.get("action", "")
-                q = _planning_queues.get(sid)
 
-                if action == "approve":
-                    if q:
-                        await q.put({"type": "approve"})
-                    # Frontend handles its own UI (exitPlanningMode + status message)
-                    # so we don't send planning_complete here to avoid a spurious
-                    # "Workflow discarded." message from the generic handler.
+# ── REST: Cancel ──
 
-                elif action == "reject":
-                    if q:
-                        await q.put({"type": "reject"})
-                    # Don't cancel the orchestrator — let planning agent return
-                    # and the orchestrator will continue its conversation loop
-                    await ws.send_json({
-                        "type": "planning_complete",
-                        "session_id": sid,
-                        "workflow_id": None,
-                    })
 
-                elif action == "test" and q:
-                    workflow_markdown = getattr(q, "_last_proposed_markdown", "")
-                    manifest_yaml = getattr(q, "_last_proposed_manifest", "")
-                    if not workflow_markdown:
-                        await ws.send_json({
-                            "type": "planning_error",
-                            "session_id": sid,
-                            "message": "No workflow to test. Generate a workflow first.",
-                        })
-                        continue
+@app.post("/api/sessions/{session_id}/cancel")
+async def api_cancel(session_id: str):
+    rt = _runtimes.get(session_id)
+    if rt and rt.task:
+        rt.task.cancel()
+        rt.planning_queue = None
+    await _get_runtime(session_id).events.put({"type": "cancelled", "session_id": session_id})
+    return {"ok": True}
 
-                    manifest = yaml.safe_load(manifest_yaml) or {}
 
-                    # Substitute default param values into markdown
-                    task = workflow_markdown
-                    for p in manifest.get("parameters", []):
-                        pname = p.get("name", "")
-                        default = p.get("default", "")
-                        if pname and default:
-                            task = task.replace(f"{{{{{pname}}}}}", default)
+# ── REST: Planning actions ──
 
-                    await ws.send_json({"type": "test_start", "session_id": sid})
 
-                    try:
-                        settings = _resolve_settings(data.get("settings"))
-                        # Run via browser-use agent with DOM (no screenshots)
-                        result = await run_agent_ws(
-                            task, ws, sid, settings,
-                            agent_overrides={
-                                "flash_mode": True,
-                                "use_thinking": False,
-                                "use_vision": "auto",
-                            },
-                        )
+class PlanningRespondRequest(BaseModel):
+    content: str
 
-                        await ws.send_json({
-                            "type": "test_result",
-                            "session_id": sid,
-                            "success": True,
-                            "return_value": result or "Workflow completed.",
-                            "error": "",
-                            "traceback": "",
-                        })
 
-                        # Feed test result back to planning agent
-                        await q.put({"type": "test_result", "success": True, "result_text": result or ""})
+@app.post("/api/sessions/{session_id}/planning/respond")
+async def api_planning_respond(session_id: str, req: PlanningRespondRequest):
+    add_message(session_id, "user", req.content)
+    rt = _runtimes.get(session_id)
+    if rt and rt.planning_queue:
+        await rt.planning_queue.put(req.content)
+    return {"ok": True}
 
-                    except Exception as e:
-                        tb = traceback.format_exc()
-                        await ws.send_json({
-                            "type": "test_result",
-                            "session_id": sid,
-                            "success": False,
-                            "error": str(e),
-                            "traceback": tb,
-                        })
-                        await q.put({"type": "test_result", "success": False, "error": str(e), "traceback": tb})
-                continue
 
-            # ── Recording complete: feed into orchestrator queue ──
-            if msg_type == "recording_complete":
-                sid = data.get("session_id", "")
-                q = _orchestrator_queues.get(sid)
-                if q:
-                    await q.put({"type": "recording", "data": data.get("recording", {})})
-                continue
+@app.post("/api/sessions/{session_id}/planning/approve")
+async def api_planning_approve(session_id: str, payload: WorkflowCreate):
+    """Save workflow AND signal the planning agent in one atomic request."""
+    data = payload.model_dump()
 
-            # ── User message: route to orchestrator ──
-            if msg_type == "message":
-                from orchestrator import run_orchestrator
+    # Save the workflow
+    if data.get("file_content"):
+        meta, _ = parse_frontmatter(data["file_content"])
+        slug = slugify(meta.get("name", "untitled"))
+    elif data.get("name"):
+        slug = slugify(data["name"])
+    else:
+        return JSONResponse(status_code=400, content={"error": "name or file_content required"})
 
-                content = data.get("content", "")
-                settings = _resolve_settings(data.get("settings"))
-                active_tab = data.get("active_tab")
-                client_session_id = data.get("session_id")
+    if get_workflow(slug):
+        # Update existing
+        save_workflow(data, workflow_id=slug)
+        wf_id = slug
+    else:
+        wf_id = save_workflow(data)
 
-                if not content:
-                    await ws.send_json({"type": "error", "message": "Empty message"})
-                    continue
+    # Signal planning agent
+    rt = _runtimes.get(session_id)
+    if rt and rt.planning_queue:
+        await rt.planning_queue.put({"type": "approve"})
 
-                if not settings.get("api_key"):
-                    await ws.send_json({"type": "error", "message": "No active model configured."})
-                    continue
+    return {"ok": True, "id": wf_id}
 
-                # Reuse existing session or create new one
-                if client_session_id:
-                    session_id = client_session_id
-                else:
-                    title = _generate_title(content)
-                    session_id = create_session(title=title)
 
-                add_message(session_id, "user", content)
+@app.post("/api/sessions/{session_id}/planning/reject")
+async def api_planning_reject(session_id: str):
+    rt = _runtimes.get(session_id)
+    if rt and rt.planning_queue:
+        await rt.planning_queue.put({"type": "reject"})
+    return {"ok": True}
 
-                # Prepend active tab context if present
-                user_content = content
-                if active_tab and active_tab.get("url"):
-                    user_content = f"[User is currently on: {active_tab['url']} — \"{active_tab.get('title', '')}\"]\n\n{content}"
 
-                await ws.send_json({
-                    "type": "session",
-                    "session_id": session_id,
-                    "title": _generate_title(content) if not client_session_id else None,
-                })
+class PlanningTestRequest(BaseModel):
+    params: dict = {}
 
-                # Get or create orchestrator for this session
-                q = _orchestrator_queues.get(session_id)
-                existing_task = _running_tasks.get(session_id)
 
-                if q and existing_task and not existing_task.done():
-                    # Orchestrator already running — feed message into its queue
-                    await q.put(user_content)
-                else:
-                    # Start new orchestrator
-                    q = asyncio.Queue()
-                    _orchestrator_queues[session_id] = q
-                    await q.put(user_content)
+@app.post("/api/sessions/{session_id}/planning/test")
+async def api_planning_test(session_id: str, req: PlanningTestRequest | None = None):
+    rt = _runtimes.get(session_id)
+    if not rt or not rt.planning_queue:
+        return JSONResponse(status_code=400, content={"error": "No active planning session"})
 
-                    async def _run_orch(sid, s, queue):
-                        try:
-                            await run_orchestrator(ws, sid, s, queue, _planning_queues)
-                        except asyncio.CancelledError:
-                            pass
-                        except Exception as e:
-                            tb_str = traceback.format_exc()
-                            print(f"Orchestrator error: {tb_str}")
-                            try:
-                                await ws.send_json(
-                                    {"type": "error", "session_id": sid, "message": str(e)}
-                                )
-                            except Exception:
-                                pass
-                        finally:
-                            _running_tasks.pop(sid, None)
-                            _orchestrator_queues.pop(sid, None)
+    q = rt.planning_queue
+    workflow_markdown = getattr(q, "_last_proposed_markdown", "")
+    manifest_yaml = getattr(q, "_last_proposed_manifest", "")
+    if not workflow_markdown:
+        return JSONResponse(status_code=400, content={"error": "No workflow to test"})
 
-                    task_handle = asyncio.create_task(_run_orch(session_id, settings, q))
-                    _running_tasks[session_id] = task_handle
-                continue
+    user_params = req.params if req else {}
+    manifest = yaml.safe_load(manifest_yaml) or {}
+    task = workflow_markdown
+    for p in manifest.get("parameters", []):
+        if isinstance(p, str):
+            pname, default = p, ""
+        else:
+            pname, default = p.get("name", ""), p.get("default", "")
+        value = user_params.get(pname) or default
+        if pname and value:
+            task = task.replace(f"{{{{{pname}}}}}", value)
 
-            # ── Cancel running task ──
-            if msg_type == "cancel":
-                sid = data.get("session_id", "")
-                task_handle = _running_tasks.pop(sid, None)
-                if task_handle:
-                    task_handle.cancel()
-                _planning_queues.pop(sid, None)
-                _orchestrator_queues.pop(sid, None)
-                await ws.send_json({
-                    "type": "cancelled",
-                    "session_id": sid,
-                })
-                continue
+    await rt.events.put({"type": "test_start", "session_id": session_id})
 
-            # Unknown message type
-            await ws.send_json({"type": "error", "message": f"Unknown message type: {msg_type}"})
+    settings = _resolve_settings()
+    try:
+        result = await run_agent(
+            task, rt.events, session_id, settings,
+            agent_overrides={"flash_mode": True, "use_thinking": False, "use_vision": "auto"},
+        )
+        await rt.events.put({
+            "type": "test_result", "session_id": session_id,
+            "success": True, "return_value": result or "Workflow completed.",
+            "error": "", "traceback": "",
+        })
+        await q.put({"type": "test_result", "success": True, "result_text": result or ""})
+    except Exception as e:
+        tb = traceback.format_exc()
+        await rt.events.put({
+            "type": "test_result", "session_id": session_id,
+            "success": False, "error": str(e), "traceback": tb,
+        })
+        await q.put({"type": "test_result", "success": False, "error": str(e), "traceback": tb})
 
-    except WebSocketDisconnect:
-        print("WebSocket client disconnected")
-        # Cancel running tasks for this connection
-        for task_handle in _running_tasks.values():
-            task_handle.cancel()
-        _running_tasks.clear()
-        _orchestrator_queues.clear()
-        _planning_queues.clear()
+    return {"ok": True}
+
+
+# ── REST: Recording complete ──
+
+
+class RecordingCompleteRequest(BaseModel):
+    start_url: str = ""
+    events: list = []
+    audio_b64: str = ""
+
+
+@app.post("/api/sessions/{session_id}/recording")
+async def api_recording_complete(session_id: str, req: RecordingCompleteRequest):
+    rt = _runtimes.get(session_id)
+    if rt:
+        await rt.orch_queue.put({"type": "recording", "data": req.model_dump()})
+    return {"ok": True}
+
+
+# ── REST: GIF replay ──
+
+
+@app.get("/api/sessions/{session_id}/replay.gif")
+async def session_replay_gif(session_id: str):
+    gif_path = CHATS_DIR / session_id / "replay.gif"
+    if not gif_path.exists():
+        return JSONResponse(status_code=404, content={"error": "No replay available"})
+    return FileResponse(str(gif_path), media_type="image/gif")
 
 
 if __name__ == "__main__":

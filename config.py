@@ -27,7 +27,7 @@ class Config:
     )
     headless: bool = os.getenv("HEADLESS", "false").lower() == "true"
     max_steps: int = int(os.getenv("MAX_STEPS", "100"))
-    max_actions_per_step: int = int(os.getenv("MAX_ACTIONS_PER_STEP", "4"))
+    max_actions_per_step: int = int(os.getenv("MAX_ACTIONS_PER_STEP", "5"))
     max_failures: int = int(os.getenv("MAX_FAILURES", "3"))
     use_vision: str = os.getenv("USE_VISION", "auto")  # "true", "false", or "auto"
     require_confirmation: bool = os.getenv("REQUIRE_CONFIRMATION", "false").lower() == "true"
@@ -36,7 +36,12 @@ class Config:
     flash_mode: bool = os.getenv("FLASH_MODE", "true").lower() == "true"
     use_thinking: bool = os.getenv("USE_THINKING", "false").lower() == "true"
     vision_detail_level: str = os.getenv("VISION_DETAIL_LEVEL", "auto")  # "auto", "low", "high"
-    max_history_items: int = int(os.getenv("MAX_HISTORY_ITEMS", "0"))  # 0 = unlimited
+    max_history_items: int = int(os.getenv("MAX_HISTORY_ITEMS", "20"))  # cap context growth
 
 
 config = Config()
+
+# Default model names — used as fallbacks when settings don't specify a model
+DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-20250514"
+DEFAULT_OPENAI_MODEL = "gpt-4o"
+DEFAULT_EXTRACTION_MODEL = "gpt-4o-mini"

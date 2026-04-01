@@ -14,6 +14,8 @@ def _make_browser(cfg=None) -> Browser:
         user_data_dir=cfg.chrome_profile_dir,
         headless=cfg.headless,
         channel="chrome",
+        minimum_wait_page_load_time=0.1,
+        wait_between_actions=0.1,
         window_size={"width": 1280, "height": 900},
         window_position={"width": 800, "height": 0},
     )

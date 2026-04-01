@@ -1,5 +1,6 @@
 // ── Constants ──
-const API_BASE = "http://localhost:8765";
+const SHOWMI_PORT = 8765;
+const API_BASE = `http://localhost:${SHOWMI_PORT}`;
 
 // ── DOM refs ──
 const messagesEl = document.getElementById("messages");
@@ -35,18 +36,14 @@ const editorSave = document.getElementById("editor-save");
 const tempSlider = document.getElementById("edit-temperature");
 const tempValue = document.getElementById("temp-value");
 
-// Logs drawer
-const logsBtn = document.getElementById("logs-btn");
-const logsDrawer = document.getElementById("logs-drawer");
-const logsClose = document.getElementById("logs-close");
-const logsClear = document.getElementById("logs-clear");
-const logsOutput = document.getElementById("logs-output");
-
 // Memory drawer
 const memoryBtn = document.getElementById("memory-btn");
 const memoryDrawer = document.getElementById("memory-drawer");
 const memoryClose = document.getElementById("memory-close");
 const memoryList = document.getElementById("memory-list");
+
+// Record workflow
+const recordBtn = document.getElementById("record-btn");
 
 // Workflows drawer
 const workflowsBtn = document.getElementById("workflows-btn");
@@ -84,15 +81,13 @@ function getProviderIconSVG(provider, size = 13) {
 }
 
 // ── State ──
-let ws = null;
-let reconnectDelay = 1000;
-const MAX_RECONNECT_DELAY = 30000;
-let failedConnections = 0;
+let eventSource = null;
 let currentSessionId = null;
 let sessions = [];
 let models = [];
 let editingModelId = null;
 let attachedTab = null; // { url, title } or null if user dismissed
+let lastToolCallPill = null; // most recent pill element, for attaching tool results
 
 // Per-session state for concurrent chats
 // { sessionId: { messages: [...elements], stepTraceEl, isWorking } }
@@ -234,6 +229,7 @@ async function loadChat(sessionId) {
     messagesEl.innerHTML = "";
     emptyStateEl.style.display = "none";
     currentSessionId = sessionId;
+    connectSSE(sessionId);
     const session = sessions.find((s) => s.id === sessionId);
     setChatTitle(session ? session.title : "");
 
@@ -257,7 +253,7 @@ async function loadChat(sessionId) {
         } else if (meta.type === "workflow_proposal") {
           renderWorkflowProposal(meta.workflow_markdown || msg.content, meta.manifest_yaml);
         } else if (meta.type === "tool_call") {
-          addToolCallPill(meta.tool, meta.args || {});
+          addToolCallPill(meta.tool, meta.args || {}, meta.result || null);
         } else {
           addMessage("agent", msg.content);
         }
@@ -275,67 +271,6 @@ async function loadChat(sessionId) {
   } catch {
     addMessage("error", "Failed to load chat history");
   }
-}
-
-// ── Logs drawer ──
-let logsWs = null;
-
-logsBtn.addEventListener("click", () => {
-  const isOpen = !logsDrawer.classList.contains("hidden");
-  if (isOpen) {
-    closeLogsDrawer();
-  } else {
-    openLogsDrawer();
-  }
-});
-
-logsClose.addEventListener("click", closeLogsDrawer);
-
-logsClear.addEventListener("click", () => {
-  logsOutput.textContent = "";
-});
-
-function openLogsDrawer() {
-  logsDrawer.classList.remove("hidden");
-  connectLogStream();
-}
-
-function closeLogsDrawer() {
-  logsDrawer.classList.add("hidden");
-  if (logsWs) {
-    try { logsWs.close(); } catch {}
-    logsWs = null;
-  }
-}
-
-function connectLogStream() {
-  if (logsWs && logsWs.readyState === WebSocket.OPEN) return;
-
-  logsOutput.textContent = "";
-  logsWs = new WebSocket("ws://localhost:8765/ws/logs");
-
-  logsWs.addEventListener("message", (event) => {
-    const line = event.data;
-    const span = document.createElement("span");
-    span.textContent = line + "\n";
-
-    // Color-code by level
-    if (/ ERROR /.test(line)) span.className = "log-line-error";
-    else if (/ WARN/.test(line)) span.className = "log-line-warn";
-
-    logsOutput.appendChild(span);
-
-    // Auto-scroll to bottom
-    logsOutput.scrollTop = logsOutput.scrollHeight;
-
-    // Cap rendered lines
-    while (logsOutput.childElementCount > 500) {
-      logsOutput.removeChild(logsOutput.firstChild);
-    }
-  });
-
-  logsWs.addEventListener("close", () => { logsWs = null; });
-  logsWs.addEventListener("error", () => {});
 }
 
 // ── Model selector (badge dropdown) ──
@@ -560,7 +495,7 @@ document.querySelector(".toggle-visibility").addEventListener("click", () => {
   input.type = input.type === "password" ? "text" : "password";
 });
 
-// ── WebSocket ──
+// ── Server connection (SSE + REST) ──
 function setStatus(state) {
   statusEl.className = "status " + state;
   statusEl.title = state.charAt(0).toUpperCase() + state.slice(1);
@@ -578,59 +513,46 @@ function hideDisconnectedBanner() {
   document.getElementById("input-area").style.display = "";
 }
 
-function connect() {
-  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+function connectSSE(sessionId) {
+  if (eventSource) { eventSource.close(); eventSource = null; }
+  if (!sessionId) return;
 
-  setStatus("connecting");
-  ws = new WebSocket("ws://localhost:8765/ws");
+  eventSource = new EventSource(`${API_BASE}/api/sessions/${sessionId}/events`);
 
-  ws.addEventListener("open", () => {
+  eventSource.onopen = () => {
     setStatus("connected");
-    reconnectDelay = 1000;
-    failedConnections = 0;
     hideDisconnectedBanner();
     updateSendState();
-  });
+  };
 
-  ws.addEventListener("close", () => {
+  eventSource.onmessage = (e) => {
+    try { handleServerMessage(JSON.parse(e.data)); } catch {}
+  };
+
+  eventSource.onerror = () => {
     setStatus("disconnected");
-    ws = null;
-    failedConnections++;
-    // Server cancels all tasks on disconnect — mirror that on the frontend
-    Object.values(sessionStates).forEach((s) => { s.isWorking = false; });
-    removeThinking();
-    exitPlanningMode();
-    updateInputState();
-    if (failedConnections >= 2) {
+    // EventSource auto-reconnects — show banner only if fully closed
+    if (eventSource && eventSource.readyState === EventSource.CLOSED) {
       showDisconnectedBanner();
     }
-    scheduleReconnect();
-  });
-
-  ws.addEventListener("error", () => {});
-
-  ws.addEventListener("message", (event) => {
-    try {
-      handleServerMessage(JSON.parse(event.data));
-    } catch {}
-  });
+  };
 }
 
-function scheduleReconnect() {
-  setTimeout(() => {
-    connect();
-    reconnectDelay = Math.min(reconnectDelay * 1.5, MAX_RECONNECT_DELAY);
-  }, reconnectDelay);
+async function checkServerHealth() {
+  try {
+    const res = await fetch(`${API_BASE}/health`);
+    if (res.ok) { setStatus("connected"); hideDisconnectedBanner(); return true; }
+  } catch {}
+  setStatus("disconnected");
+  return false;
 }
 
 // ── Retry + copy commands ──
-retryConnectBtn.addEventListener("click", () => {
-  failedConnections = 0;
-  reconnectDelay = 1000;
+retryConnectBtn.addEventListener("click", async () => {
   hideDisconnectedBanner();
-  if (ws) { try { ws.close(); } catch {} }
-  ws = null;
-  connect();
+  if (await checkServerHealth()) {
+    if (currentSessionId) connectSSE(currentSessionId);
+  }
 });
 
 document.querySelectorAll(".disconnected-cmd").forEach((el) => {
@@ -648,16 +570,6 @@ function handleServerMessage(data) {
   const msgSessionId = data.session_id;
 
   switch (data.type) {
-    case "session":
-      // Always track the session — for new chats this sets the ID,
-      // for continued chats it confirms the existing one
-      if (data.session_id) {
-        currentSessionId = data.session_id;
-        const state = getSessionState(data.session_id);
-        state.isWorking = true;
-      }
-      break;
-
     case "step": {
       const state = getSessionState(msgSessionId);
       // Only render if this is the active chat
@@ -708,6 +620,13 @@ function handleServerMessage(data) {
 
     case "tool_call_start":
       addToolCallPill(data.tool, data.args || {});
+      break;
+
+    case "tool_call_result":
+      if (lastToolCallPill) {
+        attachToolResult(lastToolCallPill, data.tool, data.result || "");
+        lastToolCallPill = null;
+      }
       break;
 
     case "orchestrator_message":
@@ -861,48 +780,59 @@ chrome.tabs.onUpdated.addListener((_tabId, changeInfo) => {
 
 async function sendMessage() {
   const text = inputEl.value.trim();
-  if (!text || !ws || ws.readyState !== WebSocket.OPEN) return;
+  if (!text) return;
 
-  // Hide empty state
   if (emptyStateEl) emptyStateEl.style.display = "none";
-
   addMessage("user", text);
   inputEl.value = "";
   autoResizeInput();
+  showThinking();
 
   if (currentMode === "planning") {
-    // In planning mode, send as planning response
-    ws.send(JSON.stringify({
-      type: "planning_response",
-      session_id: currentSessionId,
-      content: text,
-    }));
-    showThinking();
+    await fetch(`${API_BASE}/api/sessions/${currentSessionId}/planning/respond`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content: text }),
+    });
     return;
   }
 
-  const payload = {
-    type: "message",
-    content: text,
-    active_tab: attachedTab, // only included if badge is visible
-  };
+  try {
+    const flashToggle = document.getElementById("flash-toggle");
+    const res = await fetch(`${API_BASE}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        content: text,
+        session_id: currentSessionId || undefined,
+        active_tab: attachedTab,
+        flash_mode: flashToggle ? flashToggle.checked : true,
+      }),
+    });
+    const data = await res.json();
 
-  // If we have an existing session, send session_id for multi-turn
-  if (currentSessionId) {
-    payload.session_id = currentSessionId;
-  }
+    if (!res.ok) {
+      removeThinking();
+      addMessage("error", data.error || "Request failed.");
+      return;
+    }
 
-  ws.send(JSON.stringify(payload));
+    if (data.session_id && !currentSessionId) {
+      currentSessionId = data.session_id;
+      connectSSE(currentSessionId);
+    }
 
-  // Mark current session as working
-  if (currentSessionId) {
-    const state = getSessionState(currentSessionId);
-    state.isWorking = true;
-    state.stepTraceEl = null;
+    if (currentSessionId) {
+      const state = getSessionState(currentSessionId);
+      state.isWorking = true;
+      state.stepTraceEl = null;
+    }
+  } catch (err) {
+    removeThinking();
+    addMessage("error", `Connection error: ${err.message}`);
   }
 
   updateInputState();
-  showThinking();
 }
 
 // ── Rendering ──
@@ -1028,6 +958,17 @@ function addResultMessage(data) {
   // Errors are already shown inline on each step — no need to repeat here
 
   el.innerHTML = html;
+
+  if (data.gif_url) {
+    const replayBtn = document.createElement("button");
+    replayBtn.className = "replay-btn";
+    replayBtn.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg> watch replay';
+    replayBtn.addEventListener("click", () => {
+      chrome.tabs.create({ url: API_BASE + data.gif_url });
+    });
+    el.appendChild(replayBtn);
+  }
+
   messagesEl.appendChild(el);
   scrollToBottom();
 }
@@ -1063,7 +1004,7 @@ function updateInputState() {
 
 function updateSendState() {
   const hasText = inputEl.value.trim().length > 0;
-  const connected = ws && ws.readyState === WebSocket.OPEN;
+  const connected = statusEl && statusEl.classList.contains("connected");
   const isWorking = currentSessionId ? getSessionState(currentSessionId).isWorking : false;
 
   if (isWorking) {
@@ -1117,13 +1058,12 @@ sendBtn.addEventListener("click", () => {
   }
 });
 
-function cancelTask() {
-  if (!currentSessionId || !ws || ws.readyState !== WebSocket.OPEN) return;
-  ws.send(JSON.stringify({
-    type: "cancel",
-    session_id: currentSessionId,
-  }));
+async function cancelTask() {
+  if (!currentSessionId) return;
   sendBtn.disabled = true;
+  try {
+    await fetch(`${API_BASE}/api/sessions/${currentSessionId}/cancel`, { method: "POST" });
+  } catch {}
 }
 
 // ── Tool call pill (inline in chat) ──
@@ -1136,6 +1076,8 @@ const TOOL_LABELS = {
   save_as_workflow:  "save workflow",
   store_memory:      "memory",
   query_memories:    "recall memories",
+  evict_memory:      "forget memory",
+  update_workflow:   "update workflow",
 };
 
 const TOOL_ICONS = {
@@ -1147,10 +1089,12 @@ const TOOL_ICONS = {
   save_as_workflow:  "◈",
   store_memory:      "◆",
   query_memories:    "◈",
+  evict_memory:      "✕",
+  update_workflow:   "✎",
 };
 
-function addToolCallPill(toolName, args) {
-  // retrieve_memories: show each injected memory as a sub-item
+function addToolCallPill(toolName, args, result) {
+  // retrieve_memories: show each injected memory as a sub-item (legacy path)
   if (toolName === "retrieve_memories") {
     const memories = args.memories || [];
     if (memories.length === 0) return;
@@ -1176,15 +1120,17 @@ function addToolCallPill(toolName, args) {
   if (toolName === "store_memory") {
     const type = args.type || "procedural";
     const content = args.content || "";
-    const priority = args.priority || 0;
     const typeLabel = { episodic: "past run", procedural: "how-to", semantic: "fact" }[type] || type;
     const el = document.createElement("div");
     el.className = "tool-call-pill memory-pill";
     el.innerHTML =
       `<span class="tool-call-icon">◆</span>` +
       `<span class="tool-call-label">${escapeHtml(typeLabel)}</span>` +
-      `<span class="tool-call-detail">${escapeHtml(content)}</span>`;
+      `<span class="tool-call-detail">${escapeHtml(content)}</span>` +
+      `<div class="tool-call-output"></div>`;
     messagesEl.appendChild(el);
+    lastToolCallPill = el;
+    if (result) attachToolResult(el, toolName, result);
     scrollToBottom();
     return;
   }
@@ -1202,9 +1148,58 @@ function addToolCallPill(toolName, args) {
   el.innerHTML =
     `<span class="tool-call-icon">${escapeHtml(TOOL_ICONS[toolName] || "●")}</span>` +
     `<span class="tool-call-label">${escapeHtml(TOOL_LABELS[toolName] || toolName)}</span>` +
-    (detail ? `<span class="tool-call-detail">${escapeHtml(detail)}</span>` : "");
+    (detail ? `<span class="tool-call-detail">${escapeHtml(detail)}</span>` : "") +
+    `<span class="tool-call-expand-icon"></span>` +
+    `<div class="tool-call-output"></div>`;
   messagesEl.appendChild(el);
+  lastToolCallPill = el;
+  if (result) attachToolResult(el, toolName, result);
   scrollToBottom();
+}
+
+function parseMemoriesResult(text) {
+  const lines = text.split("\n").filter((l) => l.startsWith("- ["));
+  return lines.map((line) => {
+    const match = line.match(/^- \[(.+?)\] (.+)$/);
+    if (match) return { type: match[1].toLowerCase(), content: match[2] };
+    return { type: "memory", content: line.replace(/^- /, "") };
+  });
+}
+
+function attachToolResult(pillEl, toolName, resultText) {
+  if (!resultText || resultText === "") return;
+  // Skip output for browser agent / workflow — steps already show in UI
+  if (toolName === "run_browser_agent" || toolName === "run_workflow") return;
+
+  const outputEl = pillEl.querySelector(".tool-call-output");
+  if (!outputEl) return;
+
+  // Special formatting for query_memories
+  if (toolName === "query_memories") {
+    const memories = parseMemoriesResult(resultText);
+    if (memories.length > 0) {
+      outputEl.innerHTML = memories.map((m) =>
+        `<div class="memory-result-item">` +
+          `<span class="memory-result-type">${escapeHtml(m.type)}</span>` +
+          `<span class="memory-result-text">${escapeHtml(m.content)}</span>` +
+        `</div>`
+      ).join("");
+    } else {
+      outputEl.textContent = resultText;
+    }
+  } else {
+    outputEl.textContent = resultText;
+  }
+
+  // Make pill expandable
+  pillEl.classList.add("expandable");
+  const chevron = pillEl.querySelector(".tool-call-expand-icon");
+  if (chevron) chevron.textContent = "▸";
+
+  pillEl.addEventListener("click", () => {
+    pillEl.classList.toggle("expanded");
+    scrollToBottom();
+  });
 }
 
 // ── Memory drawer ──
@@ -1219,6 +1214,13 @@ if (memoryClose) {
   memoryClose.addEventListener("click", () => {
     memoryDrawer.classList.add("hidden");
   });
+}
+
+async function deleteMemory(memoryId) {
+  try {
+    await fetch(`${API_BASE}/memory/${memoryId}`, { method: "DELETE" });
+    loadMemories();
+  } catch {}
 }
 
 async function loadMemories() {
@@ -1242,8 +1244,17 @@ async function loadMemories() {
         `<div class="memory-item-header">` +
           `<span class="memory-item-type ${m.type}">${escapeHtml(typeLabel)}</span>` +
           `<span class="memory-item-meta">${m.num_uses} uses${date ? " · " + date : ""}</span>` +
+          `<button class="memory-item-delete icon-btn" title="Delete memory">` +
+            `<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">` +
+              `<line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>` +
+            `</svg>` +
+          `</button>` +
         `</div>` +
         `<div class="memory-item-content">${escapeHtml(m.content)}</div>`;
+      item.querySelector(".memory-item-delete").addEventListener("click", (e) => {
+        e.stopPropagation();
+        deleteMemory(m.id);
+      });
       memoryList.appendChild(item);
     }
   } catch {
@@ -1307,10 +1318,19 @@ async function loadWorkflows() {
         if (emptyStateEl) emptyStateEl.style.display = "none";
         const text = `Run workflow: ${wf.name}`;
         addMessage("user", text);
-        if (ws && ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: "message", content: text }));
-          showThinking();
-        }
+        showThinking();
+        fetch(`${API_BASE}/api/chat`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ content: text, active_tab: attachedTab }),
+        }).then(r => r.json()).then(data => {
+          if (data.session_id) {
+            currentSessionId = data.session_id;
+            connectSSE(currentSessionId);
+            const state = getSessionState(currentSessionId);
+            state.isWorking = true;
+          }
+        }).catch(() => { removeThinking(); addMessage("error", "Connection error."); });
       });
       workflowsList.appendChild(item);
     }
@@ -1326,6 +1346,32 @@ setInterval(() => {
     loadChats();
   }
 }, 3000);
+
+// ── Record workflow button ──
+
+if (recordBtn) {
+  recordBtn.addEventListener("click", () => {
+    if (isRecording) return;
+    currentSessionId = null;
+    messagesEl.querySelectorAll(".msg, .thinking").forEach(el => el.remove());
+    if (emptyStateEl) emptyStateEl.style.display = "none";
+    const text = "I want to show you a new workflow, start recording";
+    addMessage("user", text);
+    showThinking();
+    fetch(`${API_BASE}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content: text, active_tab: attachedTab }),
+    }).then(r => r.json()).then(data => {
+      if (data.session_id) {
+        currentSessionId = data.session_id;
+        connectSSE(currentSessionId);
+        const state = getSessionState(currentSessionId);
+        state.isWorking = true;
+      }
+    }).catch(() => { removeThinking(); addMessage("error", "Connection error."); });
+  });
+}
 
 // ── Recording (orchestrator-driven) ──
 
@@ -1445,31 +1491,51 @@ if (overlayStopBtn) {
       addMessage("system", `Recorded ${data.events.length} events.`);
       showThinking();
 
-      // Send recording back to orchestrator
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({
-          type: "recording_complete",
-          session_id: currentSessionId,
-          recording: {
+      // Send recording back to orchestrator via REST
+      try {
+        await fetch(`${API_BASE}/api/sessions/${currentSessionId}/recording`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
             start_url: data.startUrl,
             events: data.events,
             audio_b64: audio_b64,
-          },
-        }));
+          }),
+        });
         enterPlanningMode();
-      } else {
+      } catch (err) {
         removeThinking();
-        addMessage("error", "Not connected to server.");
+        addMessage("error", `Failed to send recording: ${err.message}`);
         updateInputState();
       }
     });
   });
 }
 
-// Live event count from background
+// Live event feed during recording
+const _REC_ICONS = {
+  click: "tap", input: "edit", select: "list", keypress: "key",
+  submit: "send", navigation: "nav", tab_switch: "tab",
+};
+
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg.type === "RECORDING_EVENT_COUNT" && isRecording) {
     if (overlayEventCount) overlayEventCount.textContent = String(msg.count);
+
+    // Render live event in chat area
+    if (msg.event) {
+      const ev = msg.event;
+      const label = _REC_ICONS[ev.type] || ev.type;
+      let detail = ev.target ? escapeHtml(String(ev.target).substring(0, 60)) : "";
+      if (ev.type === "input" && ev.value) detail = escapeHtml(ev.value.substring(0, 40));
+      if (ev.type === "navigation") detail = escapeHtml((ev.url || "").replace(/^https?:\/\//, "").substring(0, 50));
+
+      const el = document.createElement("div");
+      el.className = "rec-event";
+      el.innerHTML = `<span class="rec-event-type">${label}</span>${detail ? ` <span class="rec-event-detail">${detail}</span>` : ""}`;
+      messagesEl.appendChild(el);
+      scrollToBottom();
+    }
   }
 });
 
@@ -1524,10 +1590,12 @@ function renderMultipleChoice(question, choices, sessionId) {
       // Disable all choice buttons after selection
       choicesRow.querySelectorAll("button").forEach((b) => { b.disabled = true; b.classList.remove("selected"); });
       btn.classList.add("selected");
-      // Send response
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: "planning_response", session_id: sessionId, content: choice }));
-      }
+      // Send response via REST
+      fetch(`${API_BASE}/api/sessions/${sessionId}/planning/respond`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: choice }),
+      }).catch(() => {});
       showThinking();
     });
     choicesRow.appendChild(btn);
@@ -1616,91 +1684,132 @@ if (planningApprove) {
     planningApprove.disabled = true;
     planningApprove.textContent = "saving...";
 
-    // Signal planning agent first so it can clean up while we save
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({
-        type: "planning_action",
-        session_id: currentSessionId,
-        action: "approve",
-      }));
-    }
-
-    // Build file_content with YAML frontmatter
     let fileContent = lastProposedMarkdown;
     if (lastProposedManifest) {
-      // manifest is already YAML — wrap it as frontmatter
       const yaml = lastProposedManifest.trim();
       fileContent = `---\n${yaml}\n---\n\n${lastProposedMarkdown.trim()}\n`;
     }
 
-    const saveController = new AbortController();
-    const saveTimeout = setTimeout(() => saveController.abort(), 15000);
     try {
-      const res = await fetch(`${API_BASE}/api/workflows`, {
+      // Single REST call: saves workflow AND signals planning agent
+      const res = await fetch(`${API_BASE}/api/sessions/${currentSessionId}/planning/approve`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ file_content: fileContent }),
-        signal: saveController.signal,
       });
-      clearTimeout(saveTimeout);
       const result = await res.json();
       if (res.ok && result.ok) {
         addMessage("system", `Workflow saved: ${result.id}`);
-        exitPlanningMode();
-      } else if (res.status === 409) {
-        // Already exists — update instead
-        const name = fileContent.match(/name:\s*(.+)/)?.[1]?.trim() || "workflow";
-        const slug = name.toLowerCase().replace(/[^\w\s-]/g, "").replace(/[\s_]+/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "");
-        const updateRes = await fetch(`${API_BASE}/api/workflows/${slug}`, {
-          method: "PUT",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ file_content: fileContent }),
-        });
-        const updateResult = await updateRes.json();
-        if (updateRes.ok && updateResult.ok) {
-          addMessage("system", `Workflow updated: ${updateResult.id}`);
-          exitPlanningMode();
-        } else {
-          addMessage("error", updateResult.error || "Failed to save workflow.");
-          exitPlanningMode();
-        }
       } else {
         addMessage("error", result.error || "Failed to save workflow.");
-        exitPlanningMode();
       }
     } catch (err) {
-      clearTimeout(saveTimeout);
-      const msg = err.name === "AbortError" ? "Save timed out. Please try again." : `Save failed: ${err.message}`;
-      addMessage("error", msg);
-      exitPlanningMode();
+      addMessage("error", `Save failed: ${err.message}`);
     }
-    // exitPlanningMode() clears _pending and hides the bar — no explicit re-enable needed
+    exitPlanningMode();
   });
 }
 
 if (planningReject) {
-  planningReject.addEventListener("click", () => {
+  planningReject.addEventListener("click", async () => {
     if (planningReject._pending) return;
     planningReject._pending = true;
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "planning_action", session_id: currentSessionId, action: "reject" }));
-      // Let planning_complete event drive exitPlanningMode and "Workflow discarded." message
-    } else {
-      // WS is down — can't notify server, clean up locally
-      addMessage("system", "Workflow discarded.");
-      exitPlanningMode();
-    }
+    try {
+      await fetch(`${API_BASE}/api/sessions/${currentSessionId}/planning/reject`, { method: "POST" });
+    } catch {}
+    addMessage("system", "Workflow discarded.");
+    exitPlanningMode();
   });
 }
 
 if (planningTest) {
-  planningTest.addEventListener("click", () => {
-    if (ws && ws.readyState === WebSocket.OPEN && lastProposedMarkdown) {
-      ws.send(JSON.stringify({ type: "planning_action", session_id: currentSessionId, action: "test" }));
-      planningTest.disabled = true;
-      planningTest.textContent = "testing...";
-    } else {
+  planningTest.addEventListener("click", async () => {
+    if (!lastProposedMarkdown) {
       addMessage("system", "No workflow to test. Wait for a workflow proposal first.");
+      return;
+    }
+
+    // Extract parameters from manifest to prompt user
+    let params = {};
+    if (lastProposedManifest) {
+      try {
+        const lines = lastProposedManifest.split("\n");
+        let currentParam = null;
+        for (const line of lines) {
+          const nameMatch = line.match(/^\s*-?\s*name:\s*(.+)/);
+          const defaultMatch = line.match(/^\s*default:\s*(.+)/);
+          if (nameMatch) {
+            currentParam = nameMatch[1].trim();
+            params[currentParam] = "";
+          } else if (defaultMatch && currentParam) {
+            params[currentParam] = defaultMatch[1].trim();
+          }
+        }
+      } catch {}
+    }
+
+    // Show dialog if there are parameters
+    const paramNames = Object.keys(params);
+    if (paramNames.length > 0) {
+      const dialog = document.createElement("div");
+      dialog.className = "test-params-dialog";
+      dialog.innerHTML = `
+        <div class="test-params-title">test parameters</div>
+        ${paramNames.map(name => `
+          <label class="test-params-field">
+            <span class="test-params-label">${escapeHtml(name)}</span>
+            <input type="text" class="test-params-input" data-param="${escapeHtml(name)}" value="${escapeHtml(params[name])}" placeholder="${escapeHtml(name)}">
+          </label>
+        `).join("")}
+        <div class="test-params-actions">
+          <button class="btn btn-ghost btn-sm test-params-cancel">cancel</button>
+          <button class="btn btn-primary btn-sm test-params-run">run test</button>
+        </div>
+      `;
+      messagesEl.appendChild(dialog);
+      scrollToBottom();
+
+      const firstInput = dialog.querySelector("input");
+      if (firstInput) firstInput.focus();
+
+      const cleanup = () => dialog.remove();
+
+      dialog.querySelector(".test-params-cancel").addEventListener("click", cleanup);
+      dialog.querySelector(".test-params-run").addEventListener("click", async () => {
+        const userParams = {};
+        dialog.querySelectorAll(".test-params-input").forEach(input => {
+          userParams[input.dataset.param] = input.value;
+        });
+        cleanup();
+        planningTest.disabled = true;
+        planningTest.textContent = "testing...";
+        try {
+          await fetch(`${API_BASE}/api/sessions/${currentSessionId}/planning/test`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ params: userParams }),
+          });
+        } catch (err) {
+          addMessage("error", `Test failed: ${err.message}`);
+          planningTest.disabled = false;
+          planningTest.textContent = "test";
+        }
+      });
+      return;
+    }
+
+    planningTest.disabled = true;
+    planningTest.textContent = "testing...";
+    try {
+      await fetch(`${API_BASE}/api/sessions/${currentSessionId}/planning/test`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ params: {} }),
+      });
+    } catch (err) {
+      addMessage("error", `Test failed: ${err.message}`);
+      planningTest.disabled = false;
+      planningTest.textContent = "test";
     }
   });
 }
@@ -1708,5 +1817,5 @@ if (planningTest) {
 // ── Init ──
 initTheme();
 fetchModels();
-connect();
+checkServerHealth();
 refreshTabContext();

@@ -10,8 +10,7 @@ import tempfile
 import traceback
 from pathlib import Path
 
-from starlette.websockets import WebSocket, WebSocketState
-
+from config import DEFAULT_ANTHROPIC_MODEL, DEFAULT_OPENAI_MODEL
 from db import add_message
 from workflow_utils import (
     _format_recording_for_llm,
@@ -146,15 +145,9 @@ OPENAI_TOOLS = [
 ]
 
 
-async def _safe_send(ws: WebSocket, data: dict) -> bool:
-    """Send JSON over WebSocket, returning False if connection is closed."""
-    try:
-        if ws.client_state == WebSocketState.CONNECTED:
-            await ws.send_json(data)
-            return True
-    except Exception:
-        pass
-    return False
+async def _emit(event_bus: asyncio.Queue, data: dict) -> None:
+    """Push an event onto the SSE bus."""
+    await event_bus.put(data)
 
 
 # ── Audio transcription ──
@@ -248,7 +241,7 @@ async def _curate_events_anthropic(
 ) -> list[int]:
     """Use Anthropic to select important event indices."""
     client = _make_anthropic_client(settings)
-    model = settings.get("model", "claude-sonnet-4-20250514")
+    model = settings.get("model", DEFAULT_ANTHROPIC_MODEL)
 
     user_msg = _format_events_compact(events)
     if audio_transcript:
@@ -277,7 +270,7 @@ async def _curate_events_openai(
 ) -> list[int]:
     """Use OpenAI to select important event indices."""
     client = _make_openai_client(settings)
-    model = settings.get("model", "gpt-4o")
+    model = settings.get("model", DEFAULT_OPENAI_MODEL)
 
     user_msg = _format_events_compact(events)
     if audio_transcript:
@@ -353,13 +346,13 @@ def _make_openai_client(settings: dict):
 async def _run_anthropic_planning(
     messages: list,
     settings: dict,
-    ws: WebSocket,
+    event_bus: asyncio.Queue,
     session_id: str,
     queue: asyncio.Queue,
 ) -> None:
     """Run the planning conversation loop using Anthropic's API."""
     client = _make_anthropic_client(settings)
-    model = settings.get("model", "claude-sonnet-4-20250514")
+    model = settings.get("model", DEFAULT_ANTHROPIC_MODEL)
 
     while True:
         response = await client.messages.create(
@@ -371,14 +364,14 @@ async def _run_anthropic_planning(
         )
 
         assistant_content = response.content
-        messages.append({"role": "assistant", "content": assistant_content})
+        messages.append({"role": "assistant", "content": [b.model_dump() for b in assistant_content]})
 
         tool_results = []
 
         for block in assistant_content:
             if block.type == "text" and block.text.strip():
                 add_message(session_id, "assistant", block.text)
-                await _safe_send(ws,{
+                await _emit(event_bus, {
                     "type": "planning_message",
                     "session_id": session_id,
                     "content": block.text,
@@ -399,7 +392,7 @@ async def _run_anthropic_planning(
                                           "manifest_yaml": tool_input.get("manifest_yaml", ""),
                                           "workflow_markdown": tool_input.get("workflow_markdown", "")})
 
-                    await _safe_send(ws,{
+                    await _emit(event_bus, {
                         "type": "planning_tool_call",
                         "session_id": session_id,
                         "tool": "propose_workflow",
@@ -464,7 +457,7 @@ async def _run_anthropic_planning(
                     question_text = tool_input.get("question", "")
                     add_message(session_id, "assistant", question_text,
                                 metadata={"type": "ask_question", **tool_input})
-                    await _safe_send(ws,{
+                    await _emit(event_bus, {
                         "type": "planning_tool_call",
                         "session_id": session_id,
                         "tool": tool_name,
@@ -492,13 +485,13 @@ async def _run_anthropic_planning(
 async def _run_openai_planning(
     messages: list,
     settings: dict,
-    ws: WebSocket,
+    event_bus: asyncio.Queue,
     session_id: str,
     queue: asyncio.Queue,
 ) -> None:
     """Run the planning conversation loop using OpenAI's API."""
     client = _make_openai_client(settings)
-    model = settings.get("model", "gpt-4o")
+    model = settings.get("model", DEFAULT_OPENAI_MODEL)
 
     openai_messages = [{"role": "system", "content": PLANNING_SYSTEM_PROMPT}] + messages
 
@@ -516,7 +509,7 @@ async def _run_openai_planning(
 
         if message.content:
             add_message(session_id, "assistant", message.content)
-            await _safe_send(ws,{
+            await _emit(event_bus, {
                 "type": "planning_message",
                 "session_id": session_id,
                 "content": message.content,
@@ -541,7 +534,7 @@ async def _run_openai_planning(
                                           "manifest_yaml": tool_input.get("manifest_yaml", ""),
                                           "workflow_markdown": tool_input.get("workflow_markdown", "")})
 
-                    await _safe_send(ws,{
+                    await _emit(event_bus, {
                         "type": "planning_tool_call",
                         "session_id": session_id,
                         "tool": "propose_workflow",
@@ -589,7 +582,7 @@ async def _run_openai_planning(
                     question_text = tool_input.get("question", "")
                     add_message(session_id, "assistant", question_text,
                                 metadata={"type": "ask_question", **tool_input})
-                    await _safe_send(ws,{
+                    await _emit(event_bus, {
                         "type": "planning_tool_call",
                         "session_id": session_id,
                         "tool": tool_name,
@@ -616,7 +609,7 @@ async def _run_openai_planning(
 
 async def run_planning_agent(
     recording: dict,
-    ws: WebSocket,
+    event_bus: asyncio.Queue,
     session_id: str,
     settings: dict,
     queue: asyncio.Queue,
@@ -630,20 +623,20 @@ async def run_planning_agent(
         audio_b64 = recording.get("audio_b64", "")
         audio_transcript = ""
         if audio_b64:
-            await _safe_send(ws, {
+            await _emit(event_bus, {
                 "type": "planning_message",
                 "session_id": session_id,
                 "content": "Transcribing audio narration...",
             })
             audio_transcript = await transcribe_audio(audio_b64, settings)
             if audio_transcript:
-                await _safe_send(ws, {
+                await _emit(event_bus, {
                     "type": "planning_message",
                     "session_id": session_id,
                     "content": f"**Narration transcript:** {audio_transcript}",
                 })
             else:
-                await _safe_send(ws, {
+                await _emit(event_bus, {
                     "type": "planning_message",
                     "session_id": session_id,
                     "content": "Could not transcribe audio.",
@@ -652,7 +645,7 @@ async def run_planning_agent(
         raw_events = recording.get("events", [])
         filtered_events = _prefilter_events(raw_events)
 
-        await _safe_send(ws, {
+        await _emit(event_bus, {
             "type": "planning_message",
             "session_id": session_id,
             "content": f"Analyzing {len(raw_events)} recorded events...",
@@ -676,10 +669,10 @@ async def run_planning_agent(
 
         if provider == "anthropic":
             messages = [{"role": "user", "content": user_msg}]
-            await _run_anthropic_planning(messages, settings, ws, session_id, queue)
+            await _run_anthropic_planning(messages, settings, event_bus, session_id, queue)
         else:
             messages = [{"role": "user", "content": user_msg}]
-            await _run_openai_planning(messages, settings, ws, session_id, queue)
+            await _run_openai_planning(messages, settings, event_bus, session_id, queue)
 
     except asyncio.CancelledError:
         pass
@@ -687,7 +680,7 @@ async def run_planning_agent(
         tb = traceback.format_exc()
         print(f"Planning agent error: {tb}")
         try:
-            await _safe_send(ws,{
+            await _emit(event_bus, {
                 "type": "planning_error",
                 "session_id": session_id,
                 "message": str(e),
@@ -698,7 +691,7 @@ async def run_planning_agent(
 
 async def run_planning_agent_from_context(
     context_text: str,
-    ws: WebSocket,
+    event_bus: asyncio.Queue,
     session_id: str,
     settings: dict,
     queue: asyncio.Queue,
@@ -708,7 +701,7 @@ async def run_planning_agent_from_context(
     Used when the user wants to save a completed browser session as a workflow.
     """
     try:
-        await _safe_send(ws, {
+        await _emit(event_bus, {
             "type": "planning_message",
             "session_id": session_id,
             "content": "Creating workflow from conversation history...",
@@ -725,10 +718,10 @@ async def run_planning_agent_from_context(
 
         if provider == "anthropic":
             messages = [{"role": "user", "content": user_msg}]
-            await _run_anthropic_planning(messages, settings, ws, session_id, queue)
+            await _run_anthropic_planning(messages, settings, event_bus, session_id, queue)
         else:
             messages = [{"role": "user", "content": user_msg}]
-            await _run_openai_planning(messages, settings, ws, session_id, queue)
+            await _run_openai_planning(messages, settings, event_bus, session_id, queue)
 
     except asyncio.CancelledError:
         pass
@@ -736,7 +729,7 @@ async def run_planning_agent_from_context(
         tb = traceback.format_exc()
         print(f"Planning agent (from context) error: {tb}")
         try:
-            await _safe_send(ws, {
+            await _emit(event_bus, {
                 "type": "planning_error",
                 "session_id": session_id,
                 "message": str(e),

@@ -25,9 +25,16 @@ async function captureScreenshot() {
 }
 
 function broadcastEventCount() {
+  const last = recordedEvents[recordedEvents.length - 1];
   chrome.runtime.sendMessage({
     type: "RECORDING_EVENT_COUNT",
     count: recordedEvents.length,
+    event: last ? {
+      type: last.type,
+      target: last.target?.text || last.target?.aria_label || last.target?.placeholder || last.target?.tag || "",
+      value: last.value || "",
+      url: last.url || "",
+    } : null,
   }).catch(() => {});
 }
 

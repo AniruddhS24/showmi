@@ -8,14 +8,19 @@ import asyncio
 import json
 import traceback
 
-from starlette.websockets import WebSocket, WebSocketState
-
 from db import add_message, get_session_messages
 from planning import (
     _make_anthropic_client,
     _make_openai_client,
     run_planning_agent,
 )
+
+# ── Constants ──
+
+from config import DEFAULT_ANTHROPIC_MODEL, DEFAULT_OPENAI_MODEL
+
+DEFAULT_RECORDING_INSTRUCTION = "Please demonstrate the workflow. Click Stop when done."
+RESULT_DISPLAY_LIMIT = 2000
 
 # ── System prompt ──
 
@@ -41,11 +46,12 @@ exceptions. Pass the results as 'context' to run_browser_agent or run_workflow. 
 this when the user asks what you remember about something.
 
 5. **store_memory** — Persist information across sessions. Three uses:
-   - After EVERY completed browser run: store an episodic summary (type='episodic') — \
-one sentence describing what was done, on which site, and the outcome.
-   - After discovering a site-specific trick or navigation pattern: store it as \
-type='procedural'. Use priority=1 if the user explicitly corrected you.
-   - When the user states a preference or fact about themselves: store as type='semantic'.
+   - type='episodic': Store ONLY when something unexpected, novel, or noteworthy happened \
+during a run — a surprising outcome, a failure worth remembering, a new pattern discovered. \
+Do NOT store routine successful completions ("I did X on Y") — those are noise.
+   - type='procedural': Store when you discover a non-obvious site trick, workaround, or \
+navigation pattern that would help future runs. Use priority=1 if the user explicitly corrected you.
+   - type='semantic': When the user states a preference or fact about themselves.
 
 6. **start_recording** — Ask the user to demonstrate a workflow by recording their browser \
 actions. Use when the user wants to teach you something new.
@@ -55,15 +61,25 @@ Call this IMMEDIATELY after start_recording returns.
 
 8. **save_as_workflow** — Save the current session's browser actions as a reusable workflow.
 
+9. **evict_memory** — Delete a memory by ID. Use when the user asks to remove or forget \
+something, or when a memory is outdated and needs replacing (evict, then store_memory). \
+Call query_memories first to find the right ID.
+
+10. **update_workflow** — Modify a workflow's markdown file. Use when the user asks to \
+change steps, parameters, name, or description of an existing workflow. Call list_workflows \
+first to get the ID, then pass the full updated markdown including frontmatter.
+
 ## Memory Rules (follow these strictly)
 
 BEFORE any browser task:
   1. query_memories with keywords from the task (site name, action type, topic)
   2. Pass results as 'context' to run_browser_agent or run_workflow
 
-AFTER any completed browser run:
-  1. store_memory with type='episodic': one sentence — what was done, where, result
-  2. If a non-obvious site trick was discovered: also store type='procedural'
+AFTER any completed browser run — reflect before storing:
+  1. First check query_memories results from before the run — is there anything NEW worth remembering?
+  2. Only store_memory type='episodic' if something unexpected, novel, or noteworthy happened \
+(a failure, a surprising result, a new discovery). Skip routine "task completed successfully" entries.
+  3. If a non-obvious site trick or workaround was discovered: store type='procedural'
 
 IMMEDIATELY when the user corrects you or states a preference:
   - store_memory before replying. Do not ask for confirmation.
@@ -92,11 +108,6 @@ ANTHROPIC_TOOLS = [
                     "type": "string",
                     "description": "Optional context to inject into the agent's system prompt, e.g. relevant memories retrieved via query_memories.",
                 },
-                "flash_mode": {
-                    "type": "boolean",
-                    "description": "Use fast/cheap mode. Set true for simple, predictable tasks (single-page lookups, form fills, navigation). Set false for complex tasks requiring reasoning across multiple pages or dynamic decision-making.",
-                    "default": True,
-                },
             },
             "required": ["task"],
         },
@@ -120,11 +131,6 @@ ANTHROPIC_TOOLS = [
                     "type": "string",
                     "description": "Relevant memories retrieved via query_memories to inject as context.",
                     "default": "",
-                },
-                "flash_mode": {
-                    "type": "boolean",
-                    "description": "Use fast/cheap mode. Set true for simple, predictable workflows. Set false for complex multi-step workflows requiring dynamic reasoning.",
-                    "default": True,
                 },
             },
             "required": ["workflow_id"],
@@ -227,6 +233,56 @@ ANTHROPIC_TOOLS = [
             "required": ["type", "content"],
         },
     },
+    {
+        "name": "evict_memory",
+        "description": (
+            "Delete a memory by ID. Use when the user asks to remove a memory, or when "
+            "a memory is outdated/wrong and needs to be replaced (evict then store_memory). "
+            "Call query_memories first to find the ID of the memory to evict."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "memory_id": {
+                    "type": "integer",
+                    "description": "The ID of the memory to delete.",
+                },
+            },
+            "required": ["memory_id"],
+        },
+    },
+    {
+        "name": "update_workflow",
+        "description": (
+            "Modify an existing workflow's markdown file. Use when the user asks to change, "
+            "update, or tweak a workflow's steps, parameters, name, or description. "
+            "Call list_workflows first to find the workflow ID."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "workflow_id": {
+                    "type": "string",
+                    "description": "The ID (slug) of the workflow to update.",
+                },
+                "file_content": {
+                    "type": "string",
+                    "description": (
+                        "The full updated markdown content including YAML frontmatter. "
+                        "Preserve the existing frontmatter fields (name, description, parameters, "
+                        "created_at) and update only what the user asked to change. "
+                        "IMPORTANT: parameters must be a list of objects with 'name', 'description', "
+                        "and 'default' keys, e.g.:\n"
+                        "parameters:\n"
+                        "  - name: company_name\n"
+                        "    description: \"The target company\"\n"
+                        "    default: \"\""
+                    ),
+                },
+            },
+            "required": ["workflow_id", "file_content"],
+        },
+    },
 ]
 
 OPENAI_TOOLS = [
@@ -242,15 +298,9 @@ OPENAI_TOOLS = [
 ]
 
 
-async def _safe_send(ws: WebSocket, data: dict) -> bool:
-    """Send JSON over WebSocket, returning False if connection is closed."""
-    try:
-        if ws.client_state == WebSocketState.CONNECTED:
-            await ws.send_json(data)
-            return True
-    except Exception:
-        pass
-    return False
+async def _emit(event_bus: asyncio.Queue, data: dict) -> None:
+    """Push an event onto the SSE bus."""
+    await event_bus.put(data)
 
 
 # ── Tool execution ──
@@ -271,28 +321,30 @@ def _execute_query_memories(query: str) -> str:
 
 
 async def _execute_run_browser_agent(
-    task: str, ws: WebSocket, session_id: str, settings: dict,
+    task: str, event_bus: asyncio.Queue, session_id: str, settings: dict,
     context: str | None = None,
     agent_overrides: dict | None = None,
 ) -> str:
     """Execute the browser agent and return a result summary."""
-    from server import run_agent_ws
+    from server import run_agent
 
     if context:
         task = f"Context from memory:\n{context}\n\n---\n\n{task}"
 
     try:
-        result = await run_agent_ws(
-            task, ws, session_id, settings,
+        result = await run_agent(
+            task, event_bus, session_id, settings,
             agent_overrides=agent_overrides,
         )
         summary = result or "Browser agent completed (no result text)."
         return (
             f"{summary}\n\n"
             "---\n"
-            "Now call store_memory with type='episodic': one sentence summarizing what was "
-            "done, on which site, and the outcome. If a non-obvious site trick was discovered, "
-            "also call store_memory with type='procedural'."
+            "Reflect on this run. Only call store_memory if something genuinely worth "
+            "remembering happened — a surprising outcome, a failure, a new site-specific trick, "
+            "or a pattern not already in your memories. Do NOT store routine completions like "
+            "'Successfully did X on Y'. If you discovered a non-obvious workaround, store it as "
+            "type='procedural'. If something unexpected happened, store as type='episodic'."
         )
     except Exception as e:
         return f"Browser agent failed: {e}"
@@ -317,9 +369,12 @@ def _format_workflow_task(workflow: dict, task_context: str) -> str:
 
     # Fill defaults for missing params
     for p in params:
-        pname = p.get("name", "")
-        if pname and pname not in param_values and p.get("default"):
-            param_values[pname] = p["default"]
+        if isinstance(p, str):
+            pname, default = p, ""
+        else:
+            pname, default = p.get("name", ""), p.get("default", "")
+        if pname and pname not in param_values and default:
+            param_values[pname] = default
 
     # Substitute {{param}} placeholders
     resolved_body = body
@@ -347,7 +402,7 @@ def _format_workflow_task(workflow: dict, task_context: str) -> str:
 async def _execute_run_workflow(
     workflow_id: str,
     task_context: str,
-    ws: WebSocket,
+    event_bus: asyncio.Queue,
     session_id: str,
     settings: dict,
     context: str | None = None,
@@ -362,24 +417,22 @@ async def _execute_run_workflow(
 
     task = _format_workflow_task(workflow, task_context)
     return await _execute_run_browser_agent(
-        task, ws, session_id, settings,
+        task, event_bus, session_id, settings,
         context=context or None,
         agent_overrides={"flash_mode": flash_mode, "use_thinking": False, "use_vision": "auto"},
     )
 
 
 async def _execute_start_recording(
-    instruction: str, ws: WebSocket, session_id: str, queue: asyncio.Queue
+    instruction: str, event_bus: asyncio.Queue, session_id: str, queue: asyncio.Queue
 ) -> dict:
     """Send recording command to frontend and wait for recording data."""
-    await ws.send_json(
-        {
-            "type": "orchestrator_command",
-            "session_id": session_id,
-            "command": "start_recording",
-            "instruction": instruction,
-        }
-    )
+    await _emit(event_bus, {
+        "type": "orchestrator_command",
+        "session_id": session_id,
+        "command": "start_recording",
+        "instruction": instruction,
+    })
 
     # Block until the frontend sends recording_complete (routed to our queue by server.py)
     recording_data = await queue.get()
@@ -394,10 +447,10 @@ async def _execute_start_recording(
 
 async def _execute_start_planning(
     recording: dict,
-    ws: WebSocket,
+    event_bus: asyncio.Queue,
     session_id: str,
     settings: dict,
-    planning_queues: dict,
+    runtime,
 ) -> str:
     """Run the planning agent with the recorded data. Returns result summary."""
     if not recording or not recording.get("events"):
@@ -405,10 +458,10 @@ async def _execute_start_planning(
 
     planning_queue = asyncio.Queue()
     planning_queue._recording = recording
-    planning_queues[session_id] = planning_queue
+    runtime.planning_queue = planning_queue
 
     try:
-        await run_planning_agent(recording, ws, session_id, settings, planning_queue)
+        await run_planning_agent(recording, event_bus, session_id, settings, planning_queue)
         outcome = getattr(planning_queue, "_outcome", None)
         if outcome == "approved":
             return "Workflow approved and saved by the user."
@@ -421,7 +474,7 @@ async def _execute_start_planning(
     except Exception as e:
         return f"Workflow planning failed: {e}"
     finally:
-        planning_queues.pop(session_id, None)
+        runtime.planning_queue = None
 
 
 def _execute_store_memory(type: str, content: str, priority: int = 0) -> str:
@@ -435,6 +488,50 @@ def _execute_store_memory(type: str, content: str, priority: int = 0) -> str:
         return f"Failed to store memory: {e}"
 
 
+def _execute_evict_memory(memory_id: int) -> str:
+    """Delete a memory by ID."""
+    from db import delete_memory
+    try:
+        delete_memory(memory_id)
+        return f"Memory {memory_id} deleted."
+    except Exception as e:
+        return f"Failed to delete memory: {e}"
+
+
+def _execute_update_workflow(workflow_id: str, file_content: str) -> str:
+    """Update a workflow's markdown file. Validates frontmatter before saving."""
+    from workflow_utils import get_workflow, save_workflow, parse_frontmatter
+    existing = get_workflow(workflow_id)
+    if not existing:
+        return f"Workflow '{workflow_id}' not found."
+
+    # Validate frontmatter before saving
+    meta, body = parse_frontmatter(file_content)
+    if not meta:
+        return (
+            "Invalid workflow: missing YAML frontmatter. "
+            "File must start with --- and contain name, description, parameters fields."
+        )
+    if not meta.get("name"):
+        return "Invalid workflow: frontmatter must include 'name'."
+    for p in meta.get("parameters", []):
+        if not isinstance(p, dict) or "name" not in p:
+            return (
+                f"Invalid parameter format: {p!r}. Each parameter must be an object with "
+                "'name', 'description', and 'default' keys. Example:\n"
+                "parameters:\n"
+                "  - name: company_name\n"
+                "    description: \"The target company\"\n"
+                "    default: \"\""
+            )
+
+    try:
+        save_workflow({"file_content": file_content}, workflow_id=workflow_id)
+        return f"Workflow '{workflow_id}' updated."
+    except Exception as e:
+        return f"Failed to update workflow: {e}"
+
+
 def _execute_list_workflows() -> str:
     """List all saved workflows."""
     from workflow_utils import list_workflows
@@ -445,7 +542,10 @@ def _execute_list_workflows() -> str:
 
     lines = []
     for wf in wf_list:
-        params = ", ".join(p["name"] for p in wf.get("parameters", []))
+        params = ", ".join(
+            p["name"] if isinstance(p, dict) else str(p)
+            for p in wf.get("parameters", [])
+        )
         lines.append(
             f'- id="{wf["id"]}", name="{wf.get("name", wf["id"])}", '
             f'description="{wf.get("description", "")}", params=[{params}]'
@@ -456,10 +556,10 @@ def _execute_list_workflows() -> str:
 async def _execute_save_as_workflow(
     name: str,
     description: str,
-    ws: WebSocket,
+    event_bus: asyncio.Queue,
     session_id: str,
     settings: dict,
-    planning_queues: dict,
+    runtime,
 ) -> str:
     """Gather conversation context and run the planning agent to create a workflow."""
     from planning import run_planning_agent_from_context
@@ -506,11 +606,11 @@ async def _execute_save_as_workflow(
     context_text = "\n".join(context_lines)
 
     planning_queue = asyncio.Queue()
-    planning_queues[session_id] = planning_queue
+    runtime.planning_queue = planning_queue
 
     try:
         await run_planning_agent_from_context(
-            context_text, ws, session_id, settings, planning_queue
+            context_text, event_bus, session_id, settings, planning_queue
         )
         outcome = getattr(planning_queue, "_outcome", None)
         if outcome == "approved":
@@ -527,7 +627,138 @@ async def _execute_save_as_workflow(
     except Exception as e:
         return f"Workflow planning failed: {e}"
     finally:
-        planning_queues.pop(session_id, None)
+        runtime.planning_queue = None
+
+
+# ── Shared tool dispatch ──
+
+
+async def _dispatch_tool(
+    tool_name: str,
+    tool_input: dict,
+    event_bus: asyncio.Queue,
+    session_id: str,
+    settings: dict,
+    queue: asyncio.Queue,
+    runtime,
+    ctx: dict,
+) -> str:
+    """Dispatch a tool call and return the result text.
+
+    ctx is a mutable dict carrying state between calls (e.g. last_recording).
+    """
+    if tool_name == "run_browser_agent":
+        task = tool_input.get("task", "")
+        context = tool_input.get("context") or None
+        flash = settings.get("flash_mode", True)
+        return await _execute_run_browser_agent(
+            task, event_bus, session_id, settings, context=context,
+            agent_overrides={"flash_mode": flash},
+        )
+
+    if tool_name == "query_memories":
+        return _execute_query_memories(tool_input.get("query", ""))
+
+    if tool_name == "run_workflow":
+        wf_id = tool_input.get("workflow_id", "")
+        task_ctx = tool_input.get("task_context", "")
+        mem_ctx = tool_input.get("context", "") or None
+        flash = settings.get("flash_mode", True)
+        return await _execute_run_workflow(
+            wf_id, task_ctx, event_bus, session_id, settings, context=mem_ctx, flash_mode=flash
+        )
+
+    if tool_name == "start_recording":
+        instruction = tool_input.get("instruction", DEFAULT_RECORDING_INSTRUCTION)
+        recording = await _execute_start_recording(instruction, event_bus, session_id, queue)
+        ctx["last_recording"] = recording
+        event_count = len(recording.get("events", []))
+        return f"Recording received with {event_count} events. Call start_planning to process it into a workflow."
+
+    if tool_name == "start_planning":
+        rec = ctx.get("last_recording")
+        if rec:
+            result = await _execute_start_planning(rec, event_bus, session_id, settings, runtime)
+            ctx["last_recording"] = None
+            return result
+        return "No recording data available. Call start_recording first."
+
+    if tool_name == "list_workflows":
+        return _execute_list_workflows()
+
+    if tool_name == "save_as_workflow":
+        return await _execute_save_as_workflow(
+            tool_input.get("name", "workflow"),
+            tool_input.get("description", ""),
+            event_bus, session_id, settings, runtime,
+        )
+
+    if tool_name == "store_memory":
+        mem_type = tool_input.get("type", "procedural")
+        content = tool_input.get("content", "")
+        priority = int(tool_input.get("priority", 0))
+        result = _execute_store_memory(mem_type, content, priority)
+        print(f"[memory] store_memory called: type={mem_type} priority={priority} content={content[:100]!r}")
+        return result
+
+    if tool_name == "evict_memory":
+        mid = int(tool_input.get("memory_id", 0))
+        print(f"[memory] evict_memory called: id={mid}")
+        return _execute_evict_memory(mid)
+
+    if tool_name == "update_workflow":
+        return _execute_update_workflow(
+            tool_input.get("workflow_id", ""),
+            tool_input.get("file_content", ""),
+        )
+
+    print(f"[orchestrator] WARNING: unhandled tool call: {tool_name}")
+    return f"Unknown tool: {tool_name}"
+
+
+async def _handle_tool_call(
+    tool_name: str,
+    tool_input: dict,
+    event_bus: asyncio.Queue,
+    session_id: str,
+    settings: dict,
+    queue: asyncio.Queue,
+    runtime,
+    ctx: dict,
+) -> str:
+    """Emit events, dispatch tool, save to DB, and return result_text."""
+    await _emit(event_bus, {
+        "type": "tool_call_start",
+        "session_id": session_id,
+        "tool": tool_name,
+        "args": tool_input,
+    })
+
+    result_text = await _dispatch_tool(
+        tool_name, tool_input, event_bus, session_id, settings, queue, runtime, ctx
+    )
+
+    display_result = result_text[:RESULT_DISPLAY_LIMIT] + ("\u2026" if len(result_text) > RESULT_DISPLAY_LIMIT else "")
+    add_message(session_id, "assistant", f"[{tool_name}]",
+                metadata={"type": "tool_call", "tool": tool_name, "args": tool_input, "result": display_result})
+    await _emit(event_bus, {
+        "type": "tool_call_result",
+        "session_id": session_id,
+        "tool": tool_name,
+        "result": display_result,
+    })
+
+    return result_text
+
+
+async def _handle_user_message(queue: asyncio.Queue, ctx: dict) -> str:
+    """Wait for next user message, handle recording edge case."""
+    user_msg = await queue.get()
+    if isinstance(user_msg, dict) and user_msg.get("type") == "recording":
+        ctx["last_recording"] = user_msg.get("data", {})
+        event_count = len(ctx["last_recording"].get("events", []))
+        return f"[Recording received with {event_count} events. Process it into a workflow.]"
+    return str(user_msg)
 
 
 # ── Anthropic orchestrator loop ──
@@ -537,143 +768,50 @@ async def _run_orchestrator_anthropic(
     messages: list,
     system_prompt: str,
     settings: dict,
-    ws: WebSocket,
+    event_bus: asyncio.Queue,
     session_id: str,
     queue: asyncio.Queue,
-    planning_queues: dict,
+    runtime,
 ) -> None:
     """Run the orchestrator conversation loop using Anthropic's API."""
     client = _make_anthropic_client(settings)
-    model = settings.get("model", "claude-sonnet-4-20250514")
-
-    # Track the last recording received (for start_planning)
-    last_recording = None
+    model = settings.get("model", DEFAULT_ANTHROPIC_MODEL)
+    ctx = {"last_recording": None}
 
     while True:
         response = await client.messages.create(
-            model=model,
-            max_tokens=2048,
-            system=system_prompt,
-            tools=ANTHROPIC_TOOLS,
-            messages=messages,
+            model=model, max_tokens=2048, system=system_prompt,
+            tools=ANTHROPIC_TOOLS, messages=messages,
         )
 
         assistant_content = response.content
-        messages.append({"role": "assistant", "content": assistant_content})
+        messages.append({"role": "assistant", "content": [b.model_dump() for b in assistant_content]})
 
         tool_results = []
-
         for block in assistant_content:
             if block.type == "text" and block.text.strip():
                 add_message(session_id, "assistant", block.text)
-                if not await _safe_send(ws, {
+                await _emit(event_bus, {
                     "type": "orchestrator_message",
                     "session_id": session_id,
                     "content": block.text,
-                }):
-                    return  # WebSocket closed
-            elif block.type == "tool_use":
-                tool_name = block.name
-                tool_input = block.input
-                result_text = ""
-
-                # Emit tool call to frontend and persist for all tools
-                add_message(session_id, "assistant", f"[{tool_name}]",
-                            metadata={"type": "tool_call", "tool": tool_name, "args": tool_input})
-                await _safe_send(ws, {
-                    "type": "tool_call_start",
-                    "session_id": session_id,
-                    "tool": tool_name,
-                    "args": tool_input,
                 })
-
-                if tool_name == "run_browser_agent":
-                    task = tool_input.get("task", "")
-                    context = tool_input.get("context") or None
-                    flash = tool_input.get("flash_mode", True)
-                    result_text = await _execute_run_browser_agent(
-                        task, ws, session_id, settings, context=context,
-                        agent_overrides={"flash_mode": flash},
-                    )
-
-                elif tool_name == "query_memories":
-                    result_text = _execute_query_memories(tool_input.get("query", ""))
-
-                elif tool_name == "run_workflow":
-                    wf_id = tool_input.get("workflow_id", "")
-                    ctx = tool_input.get("task_context", "")
-                    mem_ctx = tool_input.get("context", "") or None
-                    flash = tool_input.get("flash_mode", True)
-                    result_text = await _execute_run_workflow(
-                        wf_id, ctx, ws, session_id, settings, context=mem_ctx, flash_mode=flash
-                    )
-
-                elif tool_name == "start_recording":
-                    instruction = tool_input.get("instruction", "Please demonstrate the workflow. Click Stop when done.")
-                    recording = await _execute_start_recording(
-                        instruction, ws, session_id, queue
-                    )
-                    last_recording = recording
-                    event_count = len(recording.get("events", []))
-                    result_text = f"Recording received with {event_count} events. Call start_planning to process it into a workflow."
-
-                elif tool_name == "start_planning":
-                    if last_recording:
-                        result_text = await _execute_start_planning(
-                            last_recording, ws, session_id, settings, planning_queues
-                        )
-                        last_recording = None
-                    else:
-                        result_text = "No recording data available. Call start_recording first."
-
-                elif tool_name == "list_workflows":
-                    result_text = _execute_list_workflows()
-
-                elif tool_name == "save_as_workflow":
-                    wf_name = tool_input.get("name", "workflow")
-                    wf_desc = tool_input.get("description", "")
-                    result_text = await _execute_save_as_workflow(
-                        wf_name, wf_desc, ws, session_id, settings, planning_queues
-                    )
-
-                elif tool_name == "store_memory":
-                    mem_type = tool_input.get("type", "procedural")
-                    content = tool_input.get("content", "")
-                    priority = int(tool_input.get("priority", 0))
-                    result_text = _execute_store_memory(mem_type, content, priority)
-                    print(f"[memory] store_memory called: type={mem_type} priority={priority} content={content[:100]!r}")
-
-                else:
-                    result_text = f"Unknown tool: {tool_name}"
-                    print(f"[orchestrator] WARNING: unhandled tool call: {tool_name}")
-
-                tool_results.append(
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": result_text,
-                    }
+            elif block.type == "tool_use":
+                result_text = await _handle_tool_call(
+                    block.name, block.input, event_bus, session_id,
+                    settings, queue, runtime, ctx,
                 )
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": result_text,
+                })
 
         if tool_results:
             messages.append({"role": "user", "content": tool_results})
         elif response.stop_reason == "end_turn":
-            # Signal frontend that orchestrator is idle — clears stop button
-            await _safe_send(ws, {"type": "orchestrator_ready", "session_id": session_id})
-            # Wait for next user message
-            user_msg = await queue.get()
-            if isinstance(user_msg, dict) and user_msg.get("type") == "recording":
-                # Recording arrived without start_recording tool call (edge case)
-                last_recording = user_msg.get("data", {})
-                event_count = len(last_recording.get("events", []))
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": f"[Recording received with {event_count} events. Process it into a workflow.]",
-                    }
-                )
-            else:
-                messages.append({"role": "user", "content": str(user_msg)})
+            await _emit(event_bus, {"type": "orchestrator_ready", "session_id": session_id})
+            messages.append({"role": "user", "content": await _handle_user_message(queue, ctx)})
 
 
 # ── OpenAI orchestrator loop ──
@@ -683,25 +821,22 @@ async def _run_orchestrator_openai(
     messages: list,
     system_prompt: str,
     settings: dict,
-    ws: WebSocket,
+    event_bus: asyncio.Queue,
     session_id: str,
     queue: asyncio.Queue,
-    planning_queues: dict,
+    runtime,
 ) -> None:
     """Run the orchestrator conversation loop using OpenAI's API."""
     client = _make_openai_client(settings)
-    model = settings.get("model", "gpt-4o")
+    model = settings.get("model", DEFAULT_OPENAI_MODEL)
+    ctx = {"last_recording": None}
 
     openai_messages = [{"role": "system", "content": system_prompt}] + messages
 
-    last_recording = None
-
     while True:
         response = await client.chat.completions.create(
-            model=model,
-            max_completion_tokens=2048,
-            tools=OPENAI_TOOLS,
-            messages=openai_messages,
+            model=model, max_completion_tokens=2048,
+            tools=OPENAI_TOOLS, messages=openai_messages,
         )
 
         choice = response.choices[0]
@@ -710,137 +845,44 @@ async def _run_orchestrator_openai(
 
         if message.content:
             add_message(session_id, "assistant", message.content)
-            if not await _safe_send(ws, {
+            await _emit(event_bus, {
                 "type": "orchestrator_message",
                 "session_id": session_id,
                 "content": message.content,
-            }):
-                return  # WebSocket closed
+            })
 
         if message.tool_calls:
             for tc in message.tool_calls:
-                tool_name = tc.function.name
                 try:
                     tool_input = json.loads(tc.function.arguments)
                 except json.JSONDecodeError:
                     tool_input = {}
 
-                result_text = ""
-
-                # Emit tool call to frontend and persist for all tools
-                add_message(session_id, "assistant", f"[{tool_name}]",
-                            metadata={"type": "tool_call", "tool": tool_name, "args": tool_input})
-                await _safe_send(ws, {
-                    "type": "tool_call_start",
-                    "session_id": session_id,
-                    "tool": tool_name,
-                    "args": tool_input,
+                result_text = await _handle_tool_call(
+                    tc.function.name, tool_input, event_bus, session_id,
+                    settings, queue, runtime, ctx,
+                )
+                openai_messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": result_text,
                 })
-
-                if tool_name == "run_browser_agent":
-                    task = tool_input.get("task", "")
-                    context = tool_input.get("context") or None
-                    flash = tool_input.get("flash_mode", True)
-                    result_text = await _execute_run_browser_agent(
-                        task, ws, session_id, settings, context=context,
-                        agent_overrides={"flash_mode": flash},
-                    )
-
-                elif tool_name == "query_memories":
-                    result_text = _execute_query_memories(tool_input.get("query", ""))
-
-                elif tool_name == "run_workflow":
-                    wf_id = tool_input.get("workflow_id", "")
-                    ctx = tool_input.get("task_context", "")
-                    mem_ctx = tool_input.get("context", "") or None
-                    flash = tool_input.get("flash_mode", True)
-                    result_text = await _execute_run_workflow(
-                        wf_id, ctx, ws, session_id, settings, context=mem_ctx, flash_mode=flash
-                    )
-
-                elif tool_name == "start_recording":
-                    instruction = tool_input.get("instruction", "Please demonstrate the workflow. Click Stop when done.")
-                    recording = await _execute_start_recording(
-                        instruction, ws, session_id, queue
-                    )
-                    last_recording = recording
-                    event_count = len(recording.get("events", []))
-                    result_text = f"Recording received with {event_count} events. Call start_planning to process it into a workflow."
-
-                elif tool_name == "start_planning":
-                    if last_recording:
-                        result_text = await _execute_start_planning(
-                            last_recording, ws, session_id, settings, planning_queues
-                        )
-                        last_recording = None
-                    else:
-                        result_text = "No recording data available. Call start_recording first."
-
-                elif tool_name == "list_workflows":
-                    result_text = _execute_list_workflows()
-
-                elif tool_name == "save_as_workflow":
-                    wf_name = tool_input.get("name", "workflow")
-                    wf_desc = tool_input.get("description", "")
-                    result_text = await _execute_save_as_workflow(
-                        wf_name, wf_desc, ws, session_id, settings, planning_queues
-                    )
-
-                elif tool_name == "store_memory":
-                    mem_type = tool_input.get("type", "procedural")
-                    content = tool_input.get("content", "")
-                    priority = int(tool_input.get("priority", 0))
-                    result_text = _execute_store_memory(mem_type, content, priority)
-                    print(f"[memory] store_memory called: type={mem_type} priority={priority} content={content[:100]!r}")
-
-                else:
-                    result_text = f"Unknown tool: {tool_name}"
-                    print(f"[orchestrator] WARNING: unhandled tool call: {tool_name}")
-
-                openai_messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tc.id,
-                        "content": result_text,
-                    }
-                )
         elif choice.finish_reason == "stop":
-            # Signal frontend that orchestrator is idle — clears stop button
-            await _safe_send(ws, {"type": "orchestrator_ready", "session_id": session_id})
-            # Wait for next user message
-            user_msg = await queue.get()
-            if isinstance(user_msg, dict) and user_msg.get("type") == "recording":
-                last_recording = user_msg.get("data", {})
-                event_count = len(last_recording.get("events", []))
-                openai_messages.append(
-                    {
-                        "role": "user",
-                        "content": f"[Recording received with {event_count} events. Process it into a workflow.]",
-                    }
-                )
-            else:
-                openai_messages.append({"role": "user", "content": str(user_msg)})
+            await _emit(event_bus, {"type": "orchestrator_ready", "session_id": session_id})
+            openai_messages.append({"role": "user", "content": await _handle_user_message(queue, ctx)})
 
 
 # ── Main entry point ──
 
 
 async def run_orchestrator(
-    ws: WebSocket,
+    event_bus: asyncio.Queue,
     session_id: str,
     settings: dict,
     queue: asyncio.Queue,
-    planning_queues: dict,
+    runtime,
 ) -> None:
-    """Run the orchestrator agent conversation loop.
-
-    Args:
-        ws: WebSocket connection
-        session_id: Current session ID
-        settings: LLM settings dict
-        queue: Queue for receiving user messages and recording data
-        planning_queues: Shared dict for planning agent queue routing
-    """
+    """Run the orchestrator agent conversation loop."""
     try:
         # Wait for first user message
         first_msg = await queue.get()
@@ -880,11 +922,11 @@ async def run_orchestrator(
 
         if provider == "anthropic":
             await _run_orchestrator_anthropic(
-                messages, ORCHESTRATOR_SYSTEM_PROMPT, settings, ws, session_id, queue, planning_queues
+                messages, ORCHESTRATOR_SYSTEM_PROMPT, settings, event_bus, session_id, queue, runtime
             )
         else:
             await _run_orchestrator_openai(
-                messages, ORCHESTRATOR_SYSTEM_PROMPT, settings, ws, session_id, queue, planning_queues
+                messages, ORCHESTRATOR_SYSTEM_PROMPT, settings, event_bus, session_id, queue, runtime
             )
 
     except asyncio.CancelledError:
@@ -893,12 +935,10 @@ async def run_orchestrator(
         tb = traceback.format_exc()
         print(f"Orchestrator error: {tb}")
         try:
-            await ws.send_json(
-                {
-                    "type": "error",
-                    "session_id": session_id,
-                    "message": f"Orchestrator error: {e}",
-                }
-            )
+            await event_bus.put({
+                "type": "error",
+                "session_id": session_id,
+                "message": f"Orchestrator error: {e}",
+            })
         except Exception:
             pass
