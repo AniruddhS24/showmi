@@ -6,7 +6,7 @@ A self-learning browser agent you control from a Chrome sidebar. See [docs](docs
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/AniruddhS24/self-learning-browseruse/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/AniruddhS24/showmi/main/install.sh | sh
 ```
 
 ## Setup
