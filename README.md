@@ -13,14 +13,11 @@ Then open Chrome, go to `chrome://extensions`, enable **Developer mode**, click 
 ## Usage
 
 ```bash
-showmi serve          # start the server
-showmi models add     # configure a model (anthropic, openai, or local)
+showmi start          # start the server (background)
+showmi status         # see server status
+showmi stop           # stop server
+showmi upgrade        # upgrade to latest version
+showmi uninstall      # delete all data and uninstall showmi
 ```
 
-Open the Showmi sidebar in Chrome and start chatting.
-
-## Uninstall
-
-```bash
-rm -rf ~/.showmi ~/.local/bin/showmi
-```
+Open the Showmi sidebar in Chrome and start chatting!
