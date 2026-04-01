@@ -10,9 +10,9 @@ import tempfile
 import traceback
 from pathlib import Path
 
-from config import DEFAULT_ANTHROPIC_MODEL, DEFAULT_OPENAI_MODEL
-from db import add_message
-from workflow_utils import (
+from .config import DEFAULT_ANTHROPIC_MODEL, DEFAULT_OPENAI_MODEL
+from .db import add_message
+from .workflow_utils import (
     _format_recording_for_llm,
     _prefilter_events,
 )
@@ -422,23 +422,6 @@ async def _run_anthropic_planning(
                             })
                             messages.append({"role": "user", "content": tool_results})
                             return
-                        elif user_response.get("type") == "test_result":
-                            if user_response.get("success"):
-                                tool_results.append({
-                                    "type": "tool_result",
-                                    "tool_use_id": block.id,
-                                    "content": f"Test PASSED. Output: {user_response.get('result_text', '')}",
-                                })
-                            else:
-                                err_msg = f"Test FAILED.\nError: {user_response.get('error', 'Unknown')}"
-                                tb = user_response.get("traceback", "")
-                                if tb:
-                                    err_msg += f"\nTraceback:\n{tb}"
-                                tool_results.append({
-                                    "type": "tool_result",
-                                    "tool_use_id": block.id,
-                                    "content": err_msg,
-                                })
                         else:
                             tool_results.append({
                                 "type": "tool_result",
@@ -552,19 +535,6 @@ async def _run_openai_planning(
                                 "content": f"User {'approved' if user_response['type'] == 'approve' else 'rejected'} the workflow.",
                             })
                             return
-                        elif user_response.get("type") == "test_result":
-                            if user_response.get("success"):
-                                content = f"Test PASSED. Output: {user_response.get('result_text', '')}"
-                            else:
-                                content = f"Test FAILED.\nError: {user_response.get('error', 'Unknown')}"
-                                tb = user_response.get("traceback", "")
-                                if tb:
-                                    content += f"\nTraceback:\n{tb}"
-                            openai_messages.append({
-                                "role": "tool",
-                                "tool_call_id": tc.id,
-                                "content": content,
-                            })
                         else:
                             openai_messages.append({
                                 "role": "tool",

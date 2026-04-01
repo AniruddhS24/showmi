@@ -15,8 +15,8 @@ dependencies = [
     "playwright>=1.40.0",
 ]
 
-[tool.setuptools]
-py-modules = ["main", "agent", "config", "hooks", "db", "server", "workflow_utils", "planning", "orchestrator"]
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [project.scripts]
-showmi = "main:cli"
+showmi = "showmi.main:cli"

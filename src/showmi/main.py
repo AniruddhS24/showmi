@@ -12,9 +12,13 @@ import time
 import urllib.request
 from pathlib import Path
 
+DEFAULT_PORT = 8765
+SHOWMI_HOME = Path.home() / ".showmi"
+LINK_PATH = Path.home() / ".local" / "bin" / "showmi"
+
 
 def _data_dir():
-    from db import SHOWMI_DIR, LOGS_DIR
+    from .db import SHOWMI_DIR, LOGS_DIR
     SHOWMI_DIR.mkdir(parents=True, exist_ok=True)
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
     return SHOWMI_DIR, LOGS_DIR
@@ -31,8 +35,8 @@ def _log_file():
 
 
 def _source_dir():
-    """Find the source directory (where server.py lives)."""
-    return Path(__file__).resolve().parent
+    """Find the repo root directory (parent of src/)."""
+    return Path(__file__).resolve().parent.parent.parent
 
 
 def _read_pid():
@@ -68,11 +72,18 @@ def _wait_for_health(port, timeout=8):
     return False
 
 
+def _prompt(text, default=None):
+    if default:
+        text = f"{text}[{default}] "
+    val = input(text).strip()
+    return val if val else (default or "")
+
+
 # ── Commands ──
 
 def cmd_start(args):
     """Start the server as a background daemon."""
-    from db import init_db
+    from .db import init_db
     init_db()
 
     port = args.port
@@ -88,15 +99,17 @@ def cmd_start(args):
     src = _source_dir()
     log = _log_file()
     log_fh = open(log, "a")
-
-    proc = subprocess.Popen(
-        [sys.executable, "-m", "uvicorn", "server:app",
-         "--host", "0.0.0.0", "--port", str(port)],
-        cwd=str(src),
-        stdout=log_fh,
-        stderr=log_fh,
-        start_new_session=True,
-    )
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "uvicorn", "showmi.server:app",
+             "--host", "0.0.0.0", "--port", str(port)],
+            cwd=str(src),
+            stdout=log_fh,
+            stderr=log_fh,
+            start_new_session=True,
+        )
+    finally:
+        log_fh.close()
 
     _pid_file().write_text(str(proc.pid))
 
@@ -149,11 +162,11 @@ def cmd_restart(args):
 def cmd_serve(args):
     """Start the server in the foreground (for development)."""
     import uvicorn
-    from db import init_db
+    from .db import init_db
 
     init_db()
     print(f"Starting Showmi (foreground) on :{args.port}")
-    uvicorn.run("server:app", host="0.0.0.0", port=args.port, reload=args.reload)
+    uvicorn.run("showmi.server:app", host="0.0.0.0", port=args.port, reload=args.reload)
 
 
 def cmd_logs(args):
@@ -171,16 +184,16 @@ def cmd_logs(args):
 def cmd_run(args):
     """Run a one-off browser task."""
     if args.confirm:
-        import config
+        from . import config
         object.__setattr__(config.config, "require_confirmation", True)
 
-    from agent import run_agent
+    from .agent import run_agent
     asyncio.run(run_agent(args.task))
 
 
 def cmd_models(args):
     """Manage LLM model configurations."""
-    from db import init_db, list_models, save_model, delete_model, set_active_model, get_active_model
+    from .db import init_db, list_models, save_model, delete_model, set_active_model, get_active_model
 
     init_db()
     action = args.action
@@ -249,7 +262,7 @@ def cmd_models(args):
 
 def cmd_sessions(args):
     """List chat sessions."""
-    from db import init_db, list_sessions, get_session_messages
+    from .db import init_db, list_sessions, get_session_messages
 
     init_db()
 
@@ -279,7 +292,7 @@ def cmd_sessions(args):
 
 def cmd_status(args):
     """Check server and config status."""
-    from db import init_db, list_models, get_active_model, SHOWMI_DIR, DB_PATH
+    from .db import init_db, list_models, get_active_model, SHOWMI_DIR, DB_PATH
 
     init_db()
 
@@ -366,10 +379,6 @@ def cmd_upgrade(args):
     print("  Reload the extension in chrome://extensions to pick up changes.")
 
 
-SHOWMI_HOME = Path.home() / ".showmi"
-LINK_PATH = Path.home() / ".local" / "bin" / "showmi"
-
-
 def cmd_uninstall(args):
     """Stop the server and remove all Showmi files."""
     import shutil
@@ -397,13 +406,6 @@ def cmd_uninstall(args):
     print("\nShowmi uninstalled.")
 
 
-def _prompt(text, default=None):
-    if default:
-        text = f"{text}[{default}] "
-    val = input(text).strip()
-    return val if val else (default or "")
-
-
 def cli():
     parser = argparse.ArgumentParser(
         prog="showmi",
@@ -413,18 +415,18 @@ def cli():
 
     # start (daemon)
     p_start = sub.add_parser("start", help="Start the server (background)")
-    p_start.add_argument("-p", "--port", type=int, default=8765)
+    p_start.add_argument("-p", "--port", type=int, default=DEFAULT_PORT)
 
     # stop
     sub.add_parser("stop", help="Stop the background server")
 
     # restart
     p_restart = sub.add_parser("restart", help="Restart the server")
-    p_restart.add_argument("-p", "--port", type=int, default=8765)
+    p_restart.add_argument("-p", "--port", type=int, default=DEFAULT_PORT)
 
     # serve (foreground, dev)
     p_serve = sub.add_parser("serve", help="Start in foreground (dev mode)")
-    p_serve.add_argument("-p", "--port", type=int, default=8765)
+    p_serve.add_argument("-p", "--port", type=int, default=DEFAULT_PORT)
     p_serve.add_argument("--reload", action="store_true", help="Auto-reload on changes")
 
     # logs
@@ -453,11 +455,11 @@ def cli():
 
     # status
     p_status = sub.add_parser("status", help="Check server and config status")
-    p_status.add_argument("-p", "--port", type=int, default=8765)
+    p_status.add_argument("-p", "--port", type=int, default=DEFAULT_PORT)
 
     # upgrade
     p_upgrade = sub.add_parser("upgrade", help="Pull latest code and reinstall")
-    p_upgrade.add_argument("-p", "--port", type=int, default=8765)
+    p_upgrade.add_argument("-p", "--port", type=int, default=DEFAULT_PORT)
 
     # uninstall
     sub.add_parser("uninstall", help="Remove Showmi and all data")

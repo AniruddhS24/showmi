@@ -694,34 +694,6 @@ function handleServerMessage(data) {
       exitPlanningMode();
       break;
 
-    case "test_start":
-      addMessage("system", "Running workflow test...");
-      if (planningTest) { planningTest.disabled = true; planningTest.textContent = "testing..."; }
-      break;
-
-    case "test_result": {
-      if (planningTest) { planningTest.disabled = false; planningTest.textContent = "test"; }
-      if (data.success) {
-        addMessage("system", `Test passed in ${(data.duration_ms / 1000).toFixed(1)}s. ${data.return_value || ""}`);
-      } else {
-        let errorMsg = `Test failed: ${data.error || "Unknown error"}`;
-        if (data.traceback) {
-          errorMsg += `\n\`\`\`\n${data.traceback}\n\`\`\``;
-        }
-        addMessage("error", errorMsg);
-        if (data.screenshot) {
-          const img = document.createElement("img");
-          img.src = `data:image/jpeg;base64,${data.screenshot}`;
-          img.className = "test-error-screenshot";
-          img.alt = "Screenshot at time of error";
-          messagesEl.appendChild(img);
-          scrollToBottom();
-        }
-      }
-      showThinking(); // agent will respond to test result
-      break;
-    }
-
     default:
       if (data.content) addMessage("agent", data.content);
   }
@@ -806,7 +778,7 @@ async function sendMessage() {
         content: text,
         session_id: currentSessionId || undefined,
         active_tab: attachedTab,
-        flash_mode: flashToggle ? flashToggle.checked : true,
+        flash_mode: flashToggle ? flashToggle.checked : false,
       }),
     });
     const data = await res.json();
@@ -1142,6 +1114,7 @@ function addToolCallPill(toolName, args, result) {
   else if (toolName === "list_workflows")   detail = "";
   else if (toolName === "save_as_workflow") detail = args.name || "";
   else if (toolName === "start_recording") detail = (args.instruction || "").substring(0, 60);
+  else if (toolName === "query_memories") detail = args.query || "";
 
   const el = document.createElement("div");
   el.className = "tool-call-pill";
@@ -1383,7 +1356,6 @@ const overlayEventCount = document.getElementById("overlay-event-count");
 const planningBar = document.getElementById("planning-bar");
 const planningApprove = document.getElementById("planning-approve");
 const planningReject = document.getElementById("planning-reject");
-const planningTest = document.getElementById("planning-test");
 
 let isRecording = false;
 let currentMode = "browser"; // "browser" | "planning"
@@ -1564,10 +1536,6 @@ function exitPlanningMode() {
     planningReject.disabled = false;
     planningReject.textContent = "reject";
   }
-  if (planningTest) {
-    planningTest.disabled = false;
-    planningTest.textContent = "test";
-  }
   updateInputState();
 }
 
@@ -1719,98 +1687,6 @@ if (planningReject) {
     } catch {}
     addMessage("system", "Workflow discarded.");
     exitPlanningMode();
-  });
-}
-
-if (planningTest) {
-  planningTest.addEventListener("click", async () => {
-    if (!lastProposedMarkdown) {
-      addMessage("system", "No workflow to test. Wait for a workflow proposal first.");
-      return;
-    }
-
-    // Extract parameters from manifest to prompt user
-    let params = {};
-    if (lastProposedManifest) {
-      try {
-        const lines = lastProposedManifest.split("\n");
-        let currentParam = null;
-        for (const line of lines) {
-          const nameMatch = line.match(/^\s*-?\s*name:\s*(.+)/);
-          const defaultMatch = line.match(/^\s*default:\s*(.+)/);
-          if (nameMatch) {
-            currentParam = nameMatch[1].trim();
-            params[currentParam] = "";
-          } else if (defaultMatch && currentParam) {
-            params[currentParam] = defaultMatch[1].trim();
-          }
-        }
-      } catch {}
-    }
-
-    // Show dialog if there are parameters
-    const paramNames = Object.keys(params);
-    if (paramNames.length > 0) {
-      const dialog = document.createElement("div");
-      dialog.className = "test-params-dialog";
-      dialog.innerHTML = `
-        <div class="test-params-title">test parameters</div>
-        ${paramNames.map(name => `
-          <label class="test-params-field">
-            <span class="test-params-label">${escapeHtml(name)}</span>
-            <input type="text" class="test-params-input" data-param="${escapeHtml(name)}" value="${escapeHtml(params[name])}" placeholder="${escapeHtml(name)}">
-          </label>
-        `).join("")}
-        <div class="test-params-actions">
-          <button class="btn btn-ghost btn-sm test-params-cancel">cancel</button>
-          <button class="btn btn-primary btn-sm test-params-run">run test</button>
-        </div>
-      `;
-      messagesEl.appendChild(dialog);
-      scrollToBottom();
-
-      const firstInput = dialog.querySelector("input");
-      if (firstInput) firstInput.focus();
-
-      const cleanup = () => dialog.remove();
-
-      dialog.querySelector(".test-params-cancel").addEventListener("click", cleanup);
-      dialog.querySelector(".test-params-run").addEventListener("click", async () => {
-        const userParams = {};
-        dialog.querySelectorAll(".test-params-input").forEach(input => {
-          userParams[input.dataset.param] = input.value;
-        });
-        cleanup();
-        planningTest.disabled = true;
-        planningTest.textContent = "testing...";
-        try {
-          await fetch(`${API_BASE}/api/sessions/${currentSessionId}/planning/test`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ params: userParams }),
-          });
-        } catch (err) {
-          addMessage("error", `Test failed: ${err.message}`);
-          planningTest.disabled = false;
-          planningTest.textContent = "test";
-        }
-      });
-      return;
-    }
-
-    planningTest.disabled = true;
-    planningTest.textContent = "testing...";
-    try {
-      await fetch(`${API_BASE}/api/sessions/${currentSessionId}/planning/test`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ params: {} }),
-      });
-    } catch (err) {
-      addMessage("error", `Test failed: ${err.message}`);
-      planningTest.disabled = false;
-      planningTest.textContent = "test";
-    }
   });
 }
 

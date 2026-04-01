@@ -73,7 +73,7 @@ ln -sf "$BIN_DIR/showmi" "$LINK_DIR/showmi"
 ok "CLI: $LINK_DIR/showmi"
 
 # ── Initialize data directory ──
-"$VENV_DIR/bin/python" -c "from db import init_db; init_db()" 2>/dev/null || true
+"$VENV_DIR/bin/python" -c "from showmi.db import init_db; init_db()" 2>/dev/null || true
 ok "Data: ~/.showmi/"
 
 # ── Check PATH ──

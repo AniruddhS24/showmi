@@ -2,8 +2,8 @@ from browser_use import Agent, Browser
 from browser_use.browser.profile import BrowserProfile
 from browser_use.llm.openai.chat import ChatOpenAI
 
-from config import _parse_use_vision, config
-from hooks import on_step_end, on_step_start
+from .config import _parse_use_vision, config
+from .hooks import on_step_end, on_step_start
 
 def _make_browser(cfg=None) -> Browser:
     """Create a Browser instance, using CDP if configured or launching with profile."""

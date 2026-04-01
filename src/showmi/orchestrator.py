@@ -8,8 +8,8 @@ import asyncio
 import json
 import traceback
 
-from db import add_message, get_session_messages
-from planning import (
+from .db import add_message, get_session_messages
+from .planning import (
     _make_anthropic_client,
     _make_openai_client,
     run_planning_agent,
@@ -17,7 +17,7 @@ from planning import (
 
 # ── Constants ──
 
-from config import DEFAULT_ANTHROPIC_MODEL, DEFAULT_OPENAI_MODEL
+from .config import DEFAULT_ANTHROPIC_MODEL, DEFAULT_OPENAI_MODEL
 
 DEFAULT_RECORDING_INSTRUCTION = "Please demonstrate the workflow. Click Stop when done."
 RESULT_DISPLAY_LIMIT = 2000
@@ -69,24 +69,26 @@ Call query_memories first to find the right ID.
 change steps, parameters, name, or description of an existing workflow. Call list_workflows \
 first to get the ID, then pass the full updated markdown including frontmatter.
 
-## Memory Rules (follow these strictly)
+## Memory Rules
 
-BEFORE any browser task:
-  1. query_memories with keywords from the task (site name, action type, topic)
-  2. Pass results as 'context' to run_browser_agent or run_workflow
+BEFORE any browser task or workflow:
+  1. Call query_memories with keywords from the task. If running a workflow, also pass workflow_slug.
+  2. Read the returned memories. Only pass the ones directly relevant to this task as 'context' \
+— omit anything unrelated. The user can see your query and results.
 
-AFTER any completed browser run — reflect before storing:
-  1. First check query_memories results from before the run — is there anything NEW worth remembering?
-  2. Only store_memory type='episodic' if something unexpected, novel, or noteworthy happened \
-(a failure, a surprising result, a new discovery). Skip routine "task completed successfully" entries.
-  3. If a non-obvious site trick or workaround was discovered: store type='procedural'
+AFTER any completed browser run:
+  The tool result will prompt you to reflect. Think about what happened:
+  - If a non-obvious workaround was discovered: store_memory type='procedural'
+  - If something unexpected/failure-worthy happened: store_memory type='episodic'
+  - If the memory relates to a specific workflow, include workflow_slug
+  - Do NOT store routine completions like 'Successfully did X on Y'
 
 IMMEDIATELY when the user corrects you or states a preference:
-  - store_memory before replying. Do not ask for confirmation.
+  - store_memory (type='semantic' or 'procedural', priority=1) before replying. Do not ask.
 
 ## Other Guidelines
 
-- Always call list_workflows before run_browser_agent. Read the results and use run_workflow if any workflow matches — do not run from scratch.
+- Always call list_workflows before run_browser_agent. If a saved workflow matches, use run_workflow.
 - If the user's intent is ambiguous, ask before acting
 - Keep your messages brief — the user can see what the agent is doing\
 """
@@ -189,9 +191,9 @@ ANTHROPIC_TOOLS = [
         "name": "query_memories",
         "description": (
             "Search stored memories for context relevant to a task. "
-            "Call this before run_browser_agent when the task involves a site or workflow "
-            "the user has used before. Returns matching memories you can pass as 'context' "
-            "to run_browser_agent. Also call this when the user asks what you remember about something."
+            "Call this before run_browser_agent or run_workflow. Returns matching memories "
+            "you can selectively pass as 'context'. When running a workflow, pass its workflow_slug "
+            "to scope results. Also call this when the user asks what you remember."
         ),
         "input_schema": {
             "type": "object",
@@ -199,6 +201,10 @@ ANTHROPIC_TOOLS = [
                 "query": {
                     "type": "string",
                     "description": "Keywords describing what to search for, e.g. 'linkedin search' or 'gmail draft'",
+                },
+                "workflow_slug": {
+                    "type": "string",
+                    "description": "Optional workflow ID to scope the search to memories for that workflow.",
                 },
             },
             "required": ["query"],
@@ -210,7 +216,8 @@ ANTHROPIC_TOOLS = [
             "Persist a correction, user preference, or site-specific trick as a memory. "
             "Call this when the user corrects you, says 'next time do X', 'remember that', "
             "'always use X for Y', 'don't forget', or provides any instruction that should "
-            "persist across sessions. Use type='procedural' + priority=1 for corrections."
+            "persist across sessions. Use type='procedural' + priority=1 for corrections. "
+            "Include workflow_slug when the memory is specific to a workflow."
         ),
         "input_schema": {
             "type": "object",
@@ -228,6 +235,10 @@ ANTHROPIC_TOOLS = [
                     "type": "integer",
                     "enum": [0, 1],
                     "description": "1 = high priority (use for human corrections), 0 = normal",
+                },
+                "workflow_slug": {
+                    "type": "string",
+                    "description": "Optional workflow ID to associate this memory with for scoped retrieval.",
                 },
             },
             "required": ["type", "content"],
@@ -306,10 +317,10 @@ async def _emit(event_bus: asyncio.Queue, data: dict) -> None:
 # ── Tool execution ──
 
 
-def _execute_query_memories(query: str) -> str:
+def _execute_query_memories(query: str, workflow_slug: str | None = None) -> str:
     """Search stored memories and return formatted results."""
-    from db import retrieve_memories, use_memory
-    memories = retrieve_memories(query, limit=5)
+    from .db import retrieve_memories, use_memory
+    memories = retrieve_memories(query, workflow_slug=workflow_slug, limit=5)
     if not memories:
         return "No relevant memories found."
     # Track usage so ranking improves over time
@@ -329,7 +340,7 @@ async def _execute_run_browser_agent(
     agent_overrides: dict | None = None,
 ) -> str:
     """Execute the browser agent and return a result summary."""
-    from server import run_agent
+    from .server import run_agent
 
     if context:
         task = f"Context from memory:\n{context}\n\n---\n\n{task}"
@@ -342,12 +353,9 @@ async def _execute_run_browser_agent(
         summary = result or "Browser agent completed (no result text)."
         return (
             f"{summary}\n\n"
-            "---\n"
-            "Reflect on this run. Only call store_memory if something genuinely worth "
-            "remembering happened — a surprising outcome, a failure, a new site-specific trick, "
-            "or a pattern not already in your memories. Do NOT store routine completions like "
-            "'Successfully did X on Y'. If you discovered a non-obvious workaround, store it as "
-            "type='procedural'. If something unexpected happened, store as type='episodic'."
+            "[Reflect] Was anything surprising, novel, or failure-worthy? "
+            "If yes, call store_memory (include workflow_slug if applicable). "
+            "If nothing noteworthy, just respond to the user."
         )
     except Exception as e:
         return f"Browser agent failed: {e}"
@@ -355,7 +363,7 @@ async def _execute_run_browser_agent(
 
 def _format_workflow_task(workflow: dict, task_context: str) -> str:
     """Convert a workflow dict into an optimized browser-use task prompt."""
-    from workflow_utils import parse_frontmatter
+    from .workflow_utils import parse_frontmatter
     import re
 
     meta, body = parse_frontmatter(workflow.get("file_content", ""))
@@ -412,7 +420,7 @@ async def _execute_run_workflow(
     flash_mode: bool = True,
 ) -> str:
     """Load a workflow and run it via browser-use agent."""
-    from workflow_utils import get_workflow
+    from .workflow_utils import get_workflow
 
     workflow = get_workflow(workflow_id)
     if not workflow:
@@ -466,10 +474,24 @@ async def _execute_start_planning(
     try:
         await run_planning_agent(recording, event_bus, session_id, settings, planning_queue)
         outcome = getattr(planning_queue, "_outcome", None)
+        manifest_yaml = getattr(planning_queue, "_last_proposed_manifest", "")
+        workflow_name = ""
+        if manifest_yaml:
+            try:
+                import yaml
+                manifest = yaml.safe_load(manifest_yaml) or {}
+                workflow_name = manifest.get("name", "")
+            except Exception:
+                pass
         if outcome == "approved":
-            return "Workflow approved and saved by the user."
+            msg = "The user APPROVED the workflow and it has been saved."
+            if workflow_name:
+                msg += f" The workflow is named '{workflow_name}'."
+                msg += f" Tell the user they can run it by asking you to run the '{workflow_name}' workflow."
+                msg += " If the workflow has parameters, list them so the user knows what to provide."
+            return msg
         elif outcome == "rejected":
-            return "Workflow rejected by the user."
+            return "The user REJECTED the workflow. It was not saved. Acknowledge this and ask if they want to try again or do something else."
         else:
             return "Workflow planning completed. The user has been asked to approve or reject."
     except asyncio.CancelledError:
@@ -480,11 +502,11 @@ async def _execute_start_planning(
         runtime.planning_queue = None
 
 
-def _execute_store_memory(type: str, content: str, priority: int = 0) -> str:
+def _execute_store_memory(type: str, content: str, priority: int = 0, workflow_slug: str | None = None) -> str:
     """Write a memory from the orchestrator context."""
-    from db import add_memory
+    from .db import add_memory
     try:
-        memory_id = add_memory(type=type, content=content, priority=priority)
+        memory_id = add_memory(type=type, content=content, priority=priority, workflow_slug=workflow_slug)
         label = "high-priority" if priority == 1 else "normal"
         return f"Memory stored (id={memory_id}, type={type}, priority={label}): {content[:100]}"
     except Exception as e:
@@ -493,7 +515,7 @@ def _execute_store_memory(type: str, content: str, priority: int = 0) -> str:
 
 def _execute_evict_memory(memory_id: int) -> str:
     """Delete a memory by ID."""
-    from db import delete_memory
+    from .db import delete_memory
     try:
         delete_memory(memory_id)
         return f"Memory {memory_id} deleted."
@@ -503,7 +525,7 @@ def _execute_evict_memory(memory_id: int) -> str:
 
 def _execute_update_workflow(workflow_id: str, file_content: str) -> str:
     """Update a workflow's markdown file. Validates frontmatter before saving."""
-    from workflow_utils import get_workflow, save_workflow, parse_frontmatter
+    from .workflow_utils import get_workflow, save_workflow, parse_frontmatter
     existing = get_workflow(workflow_id)
     if not existing:
         return f"Workflow '{workflow_id}' not found."
@@ -537,7 +559,7 @@ def _execute_update_workflow(workflow_id: str, file_content: str) -> str:
 
 def _execute_list_workflows() -> str:
     """List all saved workflows."""
-    from workflow_utils import list_workflows
+    from .workflow_utils import list_workflows
 
     wf_list = list_workflows()
     if not wf_list:
@@ -565,7 +587,7 @@ async def _execute_save_as_workflow(
     runtime,
 ) -> str:
     """Gather conversation context and run the planning agent to create a workflow."""
-    from planning import run_planning_agent_from_context
+    from .planning import run_planning_agent_from_context
 
     messages = get_session_messages(session_id)
     if not messages:
@@ -616,10 +638,24 @@ async def _execute_save_as_workflow(
             context_text, event_bus, session_id, settings, planning_queue
         )
         outcome = getattr(planning_queue, "_outcome", None)
+        manifest_yaml = getattr(planning_queue, "_last_proposed_manifest", "")
+        workflow_name = ""
+        if manifest_yaml:
+            try:
+                import yaml
+                manifest = yaml.safe_load(manifest_yaml) or {}
+                workflow_name = manifest.get("name", "")
+            except Exception:
+                pass
         if outcome == "approved":
-            return "Workflow approved and saved by the user."
+            msg = "The user APPROVED the workflow and it has been saved."
+            if workflow_name:
+                msg += f" The workflow is named '{workflow_name}'."
+                msg += f" Tell the user they can run it by asking you to run the '{workflow_name}' workflow."
+                msg += " If the workflow has parameters, list them so the user knows what to provide."
+            return msg
         elif outcome == "rejected":
-            return "Workflow rejected by the user."
+            return "The user REJECTED the workflow. It was not saved. Acknowledge this and ask if they want to try again or do something else."
         proposed = getattr(planning_queue, "_last_proposed_markdown", None)
         if proposed:
             return "Workflow created from conversation. The user has been asked to approve or reject."
@@ -660,7 +696,10 @@ async def _dispatch_tool(
         )
 
     if tool_name == "query_memories":
-        return _execute_query_memories(tool_input.get("query", ""))
+        return _execute_query_memories(
+            tool_input.get("query", ""),
+            workflow_slug=tool_input.get("workflow_slug"),
+        )
 
     if tool_name == "run_workflow":
         wf_id = tool_input.get("workflow_id", "")
@@ -700,8 +739,9 @@ async def _dispatch_tool(
         mem_type = tool_input.get("type", "procedural")
         content = tool_input.get("content", "")
         priority = int(tool_input.get("priority", 0))
-        result = _execute_store_memory(mem_type, content, priority)
-        print(f"[memory] store_memory called: type={mem_type} priority={priority} content={content[:100]!r}")
+        wf_slug = tool_input.get("workflow_slug")
+        result = _execute_store_memory(mem_type, content, priority, workflow_slug=wf_slug)
+        print(f"[memory] store_memory called: type={mem_type} priority={priority} workflow={wf_slug} content={content[:100]!r}")
         return result
 
     if tool_name == "evict_memory":

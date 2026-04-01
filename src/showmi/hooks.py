@@ -1,8 +1,8 @@
 import json
 from datetime import datetime, timezone
 
-from config import config
-from db import LOGS_DIR
+from .config import config
+from .db import LOGS_DIR
 
 
 async def on_step_start(agent) -> None:

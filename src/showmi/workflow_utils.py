@@ -10,7 +10,7 @@ from pathlib import Path
 import yaml
 from PIL import Image
 
-from db import WORKFLOWS_DIR
+from .db import WORKFLOWS_DIR
 
 
 

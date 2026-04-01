@@ -2,7 +2,6 @@ import asyncio
 import json
 import traceback
 
-import uvicorn
 import yaml
 from browser_use import Agent
 from fastapi import FastAPI
@@ -39,10 +38,10 @@ class _RobustChatOpenAI(BrowserUseChatOpenAI):
         finally:
             output_format.model_validate_json = orig
 
-from agent import _make_browser
-from config import DEFAULT_EXTRACTION_MODEL, config as default_config
-from planning import run_planning_agent
-from db import (
+from .agent import _make_browser
+from .config import DEFAULT_EXTRACTION_MODEL, config as default_config
+from .planning import run_planning_agent
+from .db import (
     add_message,
     create_session,
     CHATS_DIR,
@@ -62,7 +61,7 @@ from db import (
     update_session_status,
     update_session_title,
 )
-from workflow_utils import (
+from .workflow_utils import (
     delete_workflow,
     get_workflow,
     list_workflows,
@@ -195,7 +194,7 @@ async def get_memory():
 
 @app.delete("/memory/{memory_id}")
 async def remove_memory(memory_id: int):
-    from db import delete_memory
+    from .db import delete_memory
     delete_memory(memory_id)
     return {"ok": True}
 
@@ -438,7 +437,7 @@ async def run_agent(task: str, event_bus: asyncio.Queue, session_id: str, settin
 
     on_step_start, on_step_end = _make_step_hook(event_bus, session_id)
 
-    from config import _parse_use_vision
+    from .config import _parse_use_vision
     from pathlib import Path
 
     gif_dir = CHATS_DIR / session_id
@@ -590,12 +589,12 @@ class ChatRequest(BaseModel):
     content: str
     session_id: str | None = None
     active_tab: dict | None = None
-    flash_mode: bool = True
+    flash_mode: bool = False
 
 
 @app.post("/api/chat")
 async def api_chat(req: ChatRequest):
-    from orchestrator import run_orchestrator
+    from .orchestrator import run_orchestrator
 
     settings = _resolve_settings()
     settings["flash_mode"] = req.flash_mode
@@ -709,59 +708,6 @@ async def api_planning_reject(session_id: str):
     rt = _runtimes.get(session_id)
     if rt and rt.planning_queue:
         await rt.planning_queue.put({"type": "reject"})
-    return {"ok": True}
-
-
-class PlanningTestRequest(BaseModel):
-    params: dict = {}
-
-
-@app.post("/api/sessions/{session_id}/planning/test")
-async def api_planning_test(session_id: str, req: PlanningTestRequest | None = None):
-    rt = _runtimes.get(session_id)
-    if not rt or not rt.planning_queue:
-        return JSONResponse(status_code=400, content={"error": "No active planning session"})
-
-    q = rt.planning_queue
-    workflow_markdown = getattr(q, "_last_proposed_markdown", "")
-    manifest_yaml = getattr(q, "_last_proposed_manifest", "")
-    if not workflow_markdown:
-        return JSONResponse(status_code=400, content={"error": "No workflow to test"})
-
-    user_params = req.params if req else {}
-    manifest = yaml.safe_load(manifest_yaml) or {}
-    task = workflow_markdown
-    for p in manifest.get("parameters", []):
-        if isinstance(p, str):
-            pname, default = p, ""
-        else:
-            pname, default = p.get("name", ""), p.get("default", "")
-        value = user_params.get(pname) or default
-        if pname and value:
-            task = task.replace(f"{{{{{pname}}}}}", value)
-
-    await rt.events.put({"type": "test_start", "session_id": session_id})
-
-    settings = _resolve_settings()
-    try:
-        result = await run_agent(
-            task, rt.events, session_id, settings,
-            agent_overrides={"flash_mode": True, "use_thinking": False, "use_vision": "auto"},
-        )
-        await rt.events.put({
-            "type": "test_result", "session_id": session_id,
-            "success": True, "return_value": result or "Workflow completed.",
-            "error": "", "traceback": "",
-        })
-        await q.put({"type": "test_result", "success": True, "result_text": result or ""})
-    except Exception as e:
-        tb = traceback.format_exc()
-        await rt.events.put({
-            "type": "test_result", "session_id": session_id,
-            "success": False, "error": str(e), "traceback": tb,
-        })
-        await q.put({"type": "test_result", "success": False, "error": str(e), "traceback": tb})
-
     return {"ok": True}
 
 

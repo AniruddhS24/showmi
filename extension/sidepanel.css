@@ -1405,13 +1405,6 @@ body {
   color: inherit;
 }
 
-.test-error-screenshot {
-  max-width: 100%;
-  border-radius: 8px;
-  border: 1px solid var(--border);
-  margin: 8px 0;
-}
-
 /* ═══════════════════════════════════════
    WORKFLOW PICKER
    ═══════════════════════════════════════ */
@@ -1898,55 +1891,6 @@ body {
 .workflow-card-body::-webkit-scrollbar { width: 3px; }
 .workflow-card-body::-webkit-scrollbar-track { background: transparent; }
 .workflow-card-body::-webkit-scrollbar-thumb { background: var(--scrollbar); }
-
-/* ── Test params dialog ── */
-.test-params-dialog {
-  margin: 6px 0;
-  padding: 8px;
-  background: var(--bg-elevated);
-  border: 1px dotted var(--border-dot);
-  border-radius: var(--r);
-  animation: fadeIn var(--duration) var(--ease);
-}
-.test-params-title {
-  font-size: 9px;
-  font-weight: 600;
-  color: var(--text-muted);
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
-  margin-bottom: 6px;
-}
-.test-params-field {
-  display: block;
-  margin-bottom: 5px;
-}
-.test-params-label {
-  display: block;
-  font-size: 10px;
-  color: var(--text-dim);
-  margin-bottom: 2px;
-}
-.test-params-input {
-  width: 100%;
-  padding: 4px 6px;
-  font-family: var(--font);
-  font-size: 11px;
-  color: var(--text);
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: var(--r-sm);
-  box-sizing: border-box;
-}
-.test-params-input:focus {
-  outline: none;
-  border-color: var(--accent);
-}
-.test-params-actions {
-  display: flex;
-  gap: 6px;
-  margin-top: 8px;
-  justify-content: flex-end;
-}
 
 /* ── Reduced motion ── */
 @media (prefers-reduced-motion: reduce) {
