@@ -382,20 +382,24 @@ def retrieve_memories(
                 params.append(workflow_slug)
             params.append(limit)
             try:
+                # Two-stage: BM25 finds the most relevant matches first,
+                # then we rank those by priority/usage/recency.
                 rows = conn.execute(f"""
-                    SELECT m.id, m.type, m.content, m.workflow_slug,
-                           m.num_uses, m.priority, m.last_used_at
-                    FROM memories m
-                    JOIN memories_fts fts ON fts.rowid = m.id
-                    WHERE memories_fts MATCH ?
-                      {slug_filter}
+                    SELECT * FROM (
+                        SELECT m.id, m.type, m.content, m.workflow_slug,
+                               m.num_uses, m.priority, m.last_used_at
+                        FROM memories m
+                        JOIN memories_fts fts ON fts.rowid = m.id
+                        WHERE memories_fts MATCH ?
+                          {slug_filter}
+                        ORDER BY bm25(memories_fts) ASC
+                        LIMIT ?
+                    )
                     ORDER BY
-                        m.priority DESC,
-                        bm25(memories_fts) ASC,
-                        CASE WHEN julianday('now') - julianday(m.last_used_at) > 90 THEN 0 ELSE 1 END DESC,
-                        m.num_uses DESC,
-                        m.last_used_at DESC
-                    LIMIT ?
+                        priority DESC,
+                        CASE WHEN julianday('now') - julianday(last_used_at) > 90 THEN 0 ELSE 1 END DESC,
+                        num_uses DESC,
+                        last_used_at DESC
                 """, params).fetchall()
             except Exception:
                 rows = []

@@ -308,15 +308,18 @@ async def _emit(event_bus: asyncio.Queue, data: dict) -> None:
 
 def _execute_query_memories(query: str) -> str:
     """Search stored memories and return formatted results."""
-    from db import retrieve_memories
+    from db import retrieve_memories, use_memory
     memories = retrieve_memories(query, limit=5)
     if not memories:
         return "No relevant memories found."
+    # Track usage so ranking improves over time
+    for m in memories:
+        use_memory(m["id"])
     _TYPE_LABELS = {"episodic": "Past run", "procedural": "How-to", "semantic": "Fact"}
     lines = [f"Found {len(memories)} relevant memories:\n"]
     for m in memories:
         label = _TYPE_LABELS.get(m["type"], m["type"])
-        lines.append(f"- [{label}] {m['content']}")
+        lines.append(f"- [{label} | id={m['id']}] {m['content']}")
     return "\n".join(lines)
 
 

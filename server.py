@@ -422,9 +422,15 @@ async def run_agent(task: str, event_bus: asyncio.Queue, session_id: str, settin
             temperature=cfg.llm_temperature,
             api_key=cfg.llm_api_key,
         )
-    else:
+    elif provider == "local":
         llm = _RobustChatOpenAI(
             base_url=cfg.llm_base_url,
+            model=cfg.llm_model,
+            temperature=cfg.llm_temperature,
+            api_key=cfg.llm_api_key,
+        )
+    else:
+        llm = BrowserUseChatOpenAI(
             model=cfg.llm_model,
             temperature=cfg.llm_temperature,
             api_key=cfg.llm_api_key,
@@ -450,9 +456,14 @@ async def run_agent(task: str, event_bus: asyncio.Queue, session_id: str, settin
         "extend_system_message": SPEED_PROMPT,
         "generate_gif": gif_path,
     }
-    if provider != "anthropic":
+    if provider == "local":
         agent_kwargs["page_extraction_llm"] = BrowserUseChatOpenAI(
             base_url=cfg.llm_base_url, model=DEFAULT_EXTRACTION_MODEL,
+            temperature=0.0, api_key=cfg.llm_api_key,
+        )
+    elif provider != "anthropic":
+        agent_kwargs["page_extraction_llm"] = BrowserUseChatOpenAI(
+            model=DEFAULT_EXTRACTION_MODEL,
             temperature=0.0, api_key=cfg.llm_api_key,
         )
     if agent_overrides:
