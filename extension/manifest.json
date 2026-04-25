@@ -8,8 +8,11 @@
     "sidePanel",
     "storage",
     "tabs",
+    "tabGroups",
     "activeTab",
-    "scripting"
+    "scripting",
+    "debugger",
+    "alarms"
   ],
   "host_permissions": [
     "<all_urls>"
@@ -20,8 +23,18 @@
   "background": {
     "service_worker": "background.js"
   },
+  "icons": {
+    "16": "showmilogo.png",
+    "32": "showmilogo.png",
+    "48": "showmilogo.png",
+    "128": "showmilogo.png"
+  },
   "action": {
-    "default_title": "Open Showmi"
+    "default_title": "Open Showmi",
+    "default_icon": {
+      "16": "showmilogo.png",
+      "32": "showmilogo.png"
+    }
   },
   "web_accessible_resources": [{
     "resources": ["mic-permission.html", "mic-permission.js"],

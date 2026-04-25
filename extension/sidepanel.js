@@ -55,10 +55,8 @@ const workflowsList = document.getElementById("workflows-list");
 const disconnectedBanner = document.getElementById("disconnected-banner");
 const retryConnectBtn = document.getElementById("retry-connect-btn");
 
-// Tab context badge
-const tabContextBadge = document.getElementById("tab-context-badge");
-const tabContextUrl = document.getElementById("tab-context-url");
-const tabContextRemove = document.getElementById("tab-context-remove");
+// Inline attach error
+const attachError = document.getElementById("attach-error");
 
 // ── Provider helpers ──
 const PROVIDER_BASE_URLS = {
@@ -86,7 +84,6 @@ let currentSessionId = null;
 let sessions = [];
 let models = [];
 let editingModelId = null;
-let attachedTab = null; // { url, title } or null if user dismissed
 let lastToolCallPill = null; // most recent pill element, for attaching tool results
 
 // Per-session state for concurrent chats
@@ -121,14 +118,12 @@ newChatBtn.addEventListener("click", () => {
 });
 
 function startNewChat() {
-  // Clear messages
   messagesEl.innerHTML = "";
   messagesEl.appendChild(emptyStateEl);
   emptyStateEl.style.display = "";
   currentSessionId = null;
   setChatTitle("");
   updateInputState();
-  refreshTabContext();
 }
 
 // ── Chats drawer ──
@@ -699,56 +694,16 @@ function handleServerMessage(data) {
   }
 }
 
-// ── Tab context ──
-async function refreshTabContext() {
+// ── Active-tab helper ──
+async function getActiveTabInfo() {
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (tab && tab.url && !tab.url.startsWith("chrome://") && !tab.url.startsWith("chrome-extension://")) {
-      attachedTab = { url: tab.url, title: tab.title || "" };
-      showTabBadge();
-    } else {
-      attachedTab = null;
-      hideTabBadge();
+      return { url: tab.url, title: tab.title || "" };
     }
-  } catch {
-    attachedTab = null;
-    hideTabBadge();
-  }
+  } catch {}
+  return null;
 }
-
-function showTabBadge() {
-  if (!attachedTab) return;
-  try {
-    const url = new URL(attachedTab.url);
-    tabContextUrl.textContent = url.hostname + (url.pathname !== "/" ? url.pathname : "");
-  } catch {
-    tabContextUrl.textContent = attachedTab.url;
-  }
-  tabContextBadge.classList.remove("hidden");
-}
-
-function hideTabBadge() {
-  tabContextBadge.classList.add("hidden");
-}
-
-tabContextRemove.addEventListener("click", () => {
-  attachedTab = null;
-  hideTabBadge();
-});
-
-// Re-detect tab when user switches tabs
-chrome.tabs.onActivated.addListener(() => {
-  // Only auto-refresh if user hasn't explicitly dismissed
-  if (attachedTab !== null || !tabContextBadge.classList.contains("hidden")) {
-    refreshTabContext();
-  }
-});
-
-chrome.tabs.onUpdated.addListener((_tabId, changeInfo) => {
-  if (changeInfo.url && attachedTab !== null) {
-    refreshTabContext();
-  }
-});
 
 async function sendMessage() {
   const text = inputEl.value.trim();
@@ -759,6 +714,19 @@ async function sendMessage() {
   inputEl.value = "";
   autoResizeInput();
   showThinking();
+
+  // Showmi runs in its own Chrome tab group, never on the user's tabs. Make
+  // sure the group + an attached tab exist before the agent starts.
+  if (currentMode !== "planning") {
+    try {
+      await ensureAgentTab();
+    } catch (err) {
+      removeThinking();
+      addMessage("error", `Attach failed: ${err.message}`);
+      updateInputState();
+      return;
+    }
+  }
 
   if (currentMode === "planning") {
     await fetch(`${API_BASE}/api/sessions/${currentSessionId}/planning/respond`, {
@@ -771,13 +739,14 @@ async function sendMessage() {
 
   try {
     const flashToggle = document.getElementById("flash-toggle");
+    const activeTab = await getActiveTabInfo();
     const res = await fetch(`${API_BASE}/api/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         content: text,
         session_id: currentSessionId || undefined,
-        active_tab: attachedTab,
+        active_tab: activeTab,
         flash_mode: flashToggle ? flashToggle.checked : false,
       }),
     });
@@ -985,8 +954,8 @@ function updateSendState() {
     sendBtn.title = "Stop";
   } else {
     sendBtn.classList.remove("is-stop");
-    sendBtn.title = "Send";
     sendBtn.disabled = !hasText || !connected;
+    sendBtn.title = "Send";
   }
 }
 
@@ -1283,7 +1252,7 @@ async function loadWorkflows() {
         e.stopPropagation();
         deleteWorkflow(wf.id);
       });
-      item.addEventListener("click", (e) => {
+      item.addEventListener("click", async (e) => {
         if (e.target.closest(".chat-item-delete")) return;
         workflowsDrawer.classList.add("hidden");
         currentSessionId = null;
@@ -1292,18 +1261,31 @@ async function loadWorkflows() {
         const text = `Run workflow: ${wf.name}`;
         addMessage("user", text);
         showThinking();
-        fetch(`${API_BASE}/api/chat`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ content: text, active_tab: attachedTab }),
-        }).then(r => r.json()).then(data => {
+        // Workflows run inside the Showmi tab group, on a fresh tab if needed.
+        try {
+          await ensureAgentTab();
+        } catch (err) {
+          removeThinking();
+          addMessage("error", `Attach failed: ${err.message}`);
+          return;
+        }
+        try {
+          const r = await fetch(`${API_BASE}/api/chat`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ content: text }),
+          });
+          const data = await r.json();
           if (data.session_id) {
             currentSessionId = data.session_id;
             connectSSE(currentSessionId);
             const state = getSessionState(currentSessionId);
             state.isWorking = true;
           }
-        }).catch(() => { removeThinking(); addMessage("error", "Connection error."); });
+        } catch {
+          removeThinking();
+          addMessage("error", "Connection error.");
+        }
       });
       workflowsList.appendChild(item);
     }
@@ -1331,18 +1313,23 @@ if (recordBtn) {
     const text = "I want to show you a new workflow, start recording";
     addMessage("user", text);
     showThinking();
-    fetch(`${API_BASE}/api/chat`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ content: text, active_tab: attachedTab }),
-    }).then(r => r.json()).then(data => {
-      if (data.session_id) {
-        currentSessionId = data.session_id;
-        connectSSE(currentSessionId);
-        const state = getSessionState(currentSessionId);
-        state.isWorking = true;
-      }
-    }).catch(() => { removeThinking(); addMessage("error", "Connection error."); });
+    (async () => {
+      // Recording observes the user's current tab via content scripts only —
+      // no chrome.debugger needed, so nothing to attach here.
+      const activeTab = await getActiveTabInfo();
+      fetch(`${API_BASE}/api/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: text, active_tab: activeTab }),
+      }).then(r => r.json()).then(data => {
+        if (data.session_id) {
+          currentSessionId = data.session_id;
+          connectSSE(currentSessionId);
+          const state = getSessionState(currentSessionId);
+          state.isWorking = true;
+        }
+      }).catch(() => { removeThinking(); addMessage("error", "Connection error."); });
+    })();
   });
 }
 
@@ -1690,8 +1677,45 @@ if (planningReject) {
   });
 }
 
+// ── Auto-attach helpers (chrome.debugger) ──
+
+function showAttachError(text) {
+  if (!attachError) return;
+  if (!text) {
+    attachError.classList.add("hidden");
+    attachError.textContent = "";
+  } else {
+    attachError.textContent = text;
+    attachError.classList.remove("hidden");
+  }
+}
+
+async function registerAttachedTabWithServer(tabId) {
+  const r = await fetch(`${API_BASE}/api/session/attach`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ tab_id: tabId }),
+  });
+  if (!r.ok) {
+    const data = await r.json().catch(() => ({}));
+    throw new Error(data.error || `Server rejected attach (${r.status})`);
+  }
+}
+
+// Make sure the Showmi tab group exists and there's an attached agent tab in
+// it, then return that tab's id. Reused across chat and workflow flows so the
+// agent always operates inside its own group, never on the user's tabs.
+async function ensureAgentTab() {
+  showAttachError("");
+  const resp = await new Promise((resolve) => {
+    chrome.runtime.sendMessage({ type: "ENSURE_AGENT_TAB" }, resolve);
+  });
+  if (!resp || !resp.ok) throw new Error(resp?.error || "Attach failed.");
+  await registerAttachedTabWithServer(resp.tabId);
+  return resp.tabId;
+}
+
 // ── Init ──
 initTheme();
 fetchModels();
 checkServerHealth();
-refreshTabContext();

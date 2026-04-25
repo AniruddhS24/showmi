@@ -39,6 +39,7 @@ class _RobustChatOpenAI(BrowserUseChatOpenAI):
             output_format.model_validate_json = orig
 
 from .agent import _make_browser
+from .cdp_proxy import get_proxy, make_router as make_cdp_router
 from .config import DEFAULT_EXTRACTION_MODEL, config as default_config
 from .planning import run_planning_agent
 from .db import (
@@ -80,6 +81,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(make_cdp_router())
+
+# Tab currently attached by the extension sidepanel.
+# Shared across sessions — v1 supports one active attach at a time.
+_attached_tab_id: int | None = None
+
 
 @app.on_event("startup")
 async def startup():
@@ -89,6 +96,46 @@ async def startup():
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+# ── REST: Tab attachment ──
+
+
+class AttachRequest(BaseModel):
+    tab_id: int
+
+
+@app.post("/api/session/attach")
+async def api_session_attach(req: AttachRequest):
+    global _attached_tab_id
+    proxy = get_proxy()
+    if not proxy.is_tab_attached(req.tab_id):
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": (
+                    "Extension has not finished attaching this tab yet. "
+                    "Retry after chrome.debugger.attach completes."
+                )
+            },
+        )
+    _attached_tab_id = req.tab_id
+    return {"ok": True, "tab_id": req.tab_id}
+
+
+@app.post("/api/session/detach")
+async def api_session_detach():
+    global _attached_tab_id
+    _attached_tab_id = None
+    return {"ok": True}
+
+
+@app.get("/api/session/attach")
+async def api_session_attach_status():
+    return {
+        "tab_id": _attached_tab_id,
+        "attached_tabs": get_proxy().attached_tab_ids(),
+    }
 
 
 # ── REST: Sessions ──
@@ -413,12 +460,25 @@ async def run_agent(task: str, event_bus: asyncio.Queue, session_id: str, settin
 
     print(f"Task: {task}\nProvider: {provider}, Model: {cfg.llm_model}")
 
+    if _attached_tab_id is None:
+        raise RuntimeError(
+            "No tab attached. Open the Showmi sidepanel and click Attach to pick a tab."
+        )
+    if not get_proxy().is_tab_attached(_attached_tab_id):
+        raise RuntimeError(
+            f"Tab {_attached_tab_id} is no longer attached (debugger disconnected). "
+            "Click Attach in the sidepanel again."
+        )
+    object.__setattr__(cfg, "attach_tab_id", _attached_tab_id)
+
     browser = _make_browser(cfg)
 
     if provider == "anthropic":
+        # Newer Claude models (Opus 4.7+) reject `temperature` outright. The
+        # browser-use Anthropic adapter only forwards temperature when it's
+        # not None, so omit it for Anthropic across the board.
         llm = BrowserUseChatAnthropic(
             model=cfg.llm_model,
-            temperature=cfg.llm_temperature,
             api_key=cfg.llm_api_key,
         )
     elif provider == "local":
@@ -612,8 +672,10 @@ async def api_chat(req: ChatRequest):
 
     user_content = req.content
     if req.active_tab and req.active_tab.get("url"):
+        # In attach mode the agent drives whatever tab the user attached to,
+        # so we don't set start_url (no forced navigation). We still pass the
+        # URL/title as a hint so the LLM knows where the user is.
         user_content = f"[User is currently on: {req.active_tab['url']} — \"{req.active_tab.get('title', '')}\"]\n\n{req.content}"
-        settings["start_url"] = req.active_tab["url"]
 
     rt = _get_runtime(session_id)
 

@@ -7,41 +7,36 @@ load_dotenv()
 
 
 def _parse_use_vision(val: str) -> bool | str:
-    """Parse use_vision config: 'true' | 'false' | 'auto'."""
     v = val.lower().strip()
     if v == "auto":
         return "auto"
     return v == "true"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=False)
 class Config:
     llm_base_url: str = os.getenv("LLM_BASE_URL", "http://localhost:8000/v1")
     llm_model: str = os.getenv("LLM_MODEL", "default")
     llm_temperature: float = float(os.getenv("LLM_TEMPERATURE", "0.6"))
     llm_api_key: str = os.getenv("LLM_API_KEY", "not-needed")
-    cdp_url: str = os.getenv("CDP_URL", "")
-    chrome_profile_dir: str = os.getenv(
-        "CHROME_PROFILE_DIR",
-        os.path.expanduser("~/Library/Application Support/Google/Chrome"),
-    )
-    headless: bool = os.getenv("HEADLESS", "false").lower() == "true"
     max_steps: int = int(os.getenv("MAX_STEPS", "100"))
     max_actions_per_step: int = int(os.getenv("MAX_ACTIONS_PER_STEP", "5"))
     max_failures: int = int(os.getenv("MAX_FAILURES", "3"))
-    use_vision: str = os.getenv("USE_VISION", "auto")  # "true", "false", or "auto"
+    use_vision: str = os.getenv("USE_VISION", "auto")
     require_confirmation: bool = os.getenv("REQUIRE_CONFIRMATION", "false").lower() == "true"
 
-    # Speed tuning
     flash_mode: bool = os.getenv("FLASH_MODE", "false").lower() == "true"
     use_thinking: bool = os.getenv("USE_THINKING", "false").lower() == "true"
-    vision_detail_level: str = os.getenv("VISION_DETAIL_LEVEL", "auto")  # "auto", "low", "high"
-    max_history_items: int = int(os.getenv("MAX_HISTORY_ITEMS", "20"))  # cap context growth
+    vision_detail_level: str = os.getenv("VISION_DETAIL_LEVEL", "auto")
+    max_history_items: int = int(os.getenv("MAX_HISTORY_ITEMS", "20"))
+
+    # Runtime-only: the tab the user attached via the sidepanel.
+    # Set per-request in server.py, not from env.
+    attach_tab_id: int | None = None
 
 
 config = Config()
 
-# Default model names — used as fallbacks when settings don't specify a model
 DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-20250514"
 DEFAULT_OPENAI_MODEL = "gpt-4o"
 DEFAULT_EXTRACTION_MODEL = "gpt-4o-mini"

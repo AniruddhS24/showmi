@@ -1,0 +1,106 @@
+/* ============================================================
+   Showmi color palettes
+   ============================================================
+   This is the single source of truth for every color the
+   sidebar renders. To try a new palette, change values here —
+   no other CSS needs to be touched.
+
+   Palette groups (see :root for non-color shared tokens):
+     • Surfaces   — page, elevated cards, hover states, modal scrim
+     • Text       — primary / muted / dim, plus on-accent (text on filled bgs)
+     • Border     — solid + dotted (the ASCII look)
+     • Accent     — main brand; +text variant for legibility on bg, +dim
+                    tint for subtle backgrounds, +glow for animated rings
+     • Status     — success / error / warning, each with a soft "dim" tint
+     • Code block — bg + text (intentionally independent of theme; code
+                    panels read best with their own contrast)
+     • Misc       — scrollbar, drop shadow
+
+   Convention: "-dim" tokens are translucent / soft tints meant to sit
+   behind their solid sibling (e.g. --accent-dim background under --accent
+   text). Keep these synced with the solid color when remixing.
+   ============================================================ */
+
+[data-theme="dark"] {
+  /* Surfaces */
+  --bg:            #292a2d;
+  --bg-elevated:   #1f2023;
+  --bg-hover:      #35363a;
+  --scrim:         rgba(0, 0, 0, 0.5);
+
+  /* Text */
+  --text:          #ededef;
+  --text-muted:    #8b8b92;
+  --text-dim:      #55555c;
+  --on-accent:     #ffffff;
+
+  /* Border */
+  --border:        #3a3b3f;
+  --border-dot:    #4a4b50;
+
+  /* Accent */
+  --accent:        #5e6ad2;
+  --accent-text:   #8b95e6;
+  --accent-dim:    rgba(94, 106, 210, 0.12);
+  --accent-glow:   rgba(94, 106, 210, 0.35);
+
+  /* Status — solid + dim */
+  --success:        #2ea043;
+  --success-dim:    rgba(46, 160, 67, 0.10);
+  --success-strong: rgba(46, 160, 67, 0.18);
+  --error:          #f85149;
+  --error-dim:      rgba(248, 81, 73, 0.08);
+  --error-strong:   rgba(248, 81, 73, 0.18);
+  --warning:        #d29922;
+  --warning-dim:    rgba(210, 153, 34, 0.10);
+
+  /* Code block */
+  --code-bg:        #1a1a2e;
+  --code-text:      #e0e0e0;
+
+  /* Misc */
+  --scrollbar:      #3a3b3f;
+  --shadow:         rgba(0, 0, 0, 0.30);
+}
+
+[data-theme="light"] {
+  /* Surfaces */
+  --bg:            #ffffff;
+  --bg-elevated:   #f5f5f7;
+  --bg-hover:      #ebebed;
+  --scrim:         rgba(0, 0, 0, 0.35);
+
+  /* Text */
+  --text:          #18181b;
+  --text-muted:    #71717a;
+  --text-dim:      #a1a1aa;
+  --on-accent:     #ffffff;
+
+  /* Border */
+  --border:        #e0e0e3;
+  --border-dot:    #c8c8cd;
+
+  /* Accent */
+  --accent:        #5e6ad2;
+  --accent-text:   #4f58b8;
+  --accent-dim:    rgba(94, 106, 210, 0.06);
+  --accent-glow:   rgba(94, 106, 210, 0.25);
+
+  /* Status — solid + dim */
+  --success:        #1a7f37;
+  --success-dim:    rgba(26, 127, 55, 0.08);
+  --success-strong: rgba(26, 127, 55, 0.16);
+  --error:          #cf222e;
+  --error-dim:      rgba(207, 34, 46, 0.06);
+  --error-strong:   rgba(207, 34, 46, 0.14);
+  --warning:        #bf8700;
+  --warning-dim:    rgba(191, 135, 0, 0.08);
+
+  /* Code block */
+  --code-bg:        #1a1a2e;
+  --code-text:      #e0e0e0;
+
+  /* Misc */
+  --scrollbar:      #d0d0d5;
+  --shadow:         rgba(0, 0, 0, 0.10);
+}

@@ -7,6 +7,9 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <!-- Color palette (light + dark). Loaded first so sidepanel.css's
+       var(--…) references resolve. Edit theme.css to try other palettes. -->
+  <link rel="stylesheet" href="theme.css" />
   <link rel="stylesheet" href="sidepanel.css" />
 </head>
 <body>
@@ -193,9 +196,7 @@
   <main id="messages">
     <div class="empty-state" id="empty-state">
       <div class="empty-icon">
-        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/>
-        </svg>
+        <img src="showmilogo.png" alt="Showmi" class="empty-logo" />
       </div>
       <p>describe a task to begin</p>
     </div>
@@ -207,17 +208,7 @@
       <button id="planning-approve" class="btn btn-primary btn-sm">approve</button>
       <button id="planning-reject" class="btn btn-ghost btn-sm">reject</button>
     </div>
-    <div id="tab-context-badge" class="tab-context-badge hidden">
-      <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/>
-      </svg>
-      <span id="tab-context-url"></span>
-      <button id="tab-context-remove" class="tab-context-remove" title="Remove tab context">
-        <svg width="8" height="8" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
-          <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
-        </svg>
-      </button>
-    </div>
+    <div id="attach-error" class="attach-error hidden"></div>
     <div id="recording-overlay" class="recording-overlay hidden">
       <button id="overlay-stop-btn" class="btn btn-stop">
         <span class="stop-icon"></span> stop recording <span id="overlay-event-count" class="event-count">0</span>
