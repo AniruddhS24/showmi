@@ -153,6 +153,15 @@ async function handleControlMessage(raw) {
     } catch (err) {
       sendControl({ type: "CLOSE_TAB_ERR", reqId, error: String(err?.message || err) });
     }
+  } else if (type === "ENSURE_AGENT_TAB") {
+    // Server is starting a browser task and needs an agent tab. Create the
+    // Showmi group + a tab if neither exists yet, otherwise reuse.
+    try {
+      const tabId = await ensureAgentTab();
+      sendControl({ type: "ENSURE_AGENT_TAB_OK", reqId, tabId });
+    } catch (err) {
+      sendControl({ type: "ENSURE_AGENT_TAB_ERR", reqId, error: String(err?.message || err) });
+    }
   } else if (type === "ACTIVATE_TAB") {
     try {
       await chrome.tabs.update(msg.tabId, { active: true });
@@ -527,22 +536,6 @@ async function stopRecording() {
 // ── Message router ──
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (msg.type === "ENSURE_AGENT_TAB") {
-    (async () => {
-      try {
-        const tabId = await ensureAgentTab();
-        const tab = await chrome.tabs.get(tabId).catch(() => null);
-        sendResponse({ ok: true, tabId, url: tab?.url || "", title: tab?.title || "" });
-      } catch (err) {
-        const msgText = String(err?.message || err);
-        const friendlier = msgText.includes("Another debugger")
-          ? "DevTools (or another debugger) is already attached to the Showmi tab. Close it and try again."
-          : msgText;
-        sendResponse({ ok: false, error: friendlier });
-      }
-    })();
-    return true;
-  }
 
   if (msg.type === "DETACH_ACTIVE_TAB") {
     (async () => {

@@ -460,16 +460,20 @@ async def run_agent(task: str, event_bus: asyncio.Queue, session_id: str, settin
 
     print(f"Task: {task}\nProvider: {provider}, Model: {cfg.llm_model}")
 
-    if _attached_tab_id is None:
+    # Lazy-create the Showmi tab group at the moment a browser task starts —
+    # not when the user just sends a chat message. The proxy reuses any
+    # existing agent tab; otherwise it asks the extension to spawn one.
+    proxy = get_proxy()
+    try:
+        tab_id = await proxy.ensure_agent_tab()
+    except RuntimeError as e:
         raise RuntimeError(
-            "No tab attached. Open the Showmi sidepanel and click Attach to pick a tab."
-        )
-    if not get_proxy().is_tab_attached(_attached_tab_id):
-        raise RuntimeError(
-            f"Tab {_attached_tab_id} is no longer attached (debugger disconnected). "
-            "Click Attach in the sidepanel again."
-        )
-    object.__setattr__(cfg, "attach_tab_id", _attached_tab_id)
+            f"Could not start a Showmi browser tab: {e}. "
+            "Make sure the Showmi side panel is open in Chrome."
+        ) from e
+    global _attached_tab_id
+    _attached_tab_id = tab_id
+    object.__setattr__(cfg, "attach_tab_id", tab_id)
 
     browser = _make_browser(cfg)
 

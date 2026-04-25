@@ -114,12 +114,17 @@ class CDPProxy:
                     self.tab_info[tab_id]["url"] = msg["url"]
                 if "title" in msg:
                     self.tab_info[tab_id]["title"] = msg["title"]
-        elif typ in ("CREATE_TAB_OK", "CREATE_TAB_ERR", "CLOSE_TAB_OK", "CLOSE_TAB_ERR"):
+        elif typ in (
+            "CREATE_TAB_OK", "CREATE_TAB_ERR",
+            "CLOSE_TAB_OK", "CLOSE_TAB_ERR",
+            "ENSURE_AGENT_TAB_OK", "ENSURE_AGENT_TAB_ERR",
+        ):
             req_id = msg.get("reqId")
             fut = self._control_pending.pop(req_id, None) if req_id is not None else None
             if fut and not fut.done():
                 if typ.endswith("_OK"):
-                    fut.set_result(msg.get("tabId") if typ == "CREATE_TAB_OK" else True)
+                    # CREATE_TAB and ENSURE_AGENT_TAB return tabId; CLOSE_TAB just acks.
+                    fut.set_result(msg.get("tabId") if "tabId" in msg else True)
                 else:
                     fut.set_exception(RuntimeError(msg.get("error", typ)))
         else:
@@ -396,6 +401,17 @@ class CDPProxy:
 
     def attached_tab_ids(self) -> list[int]:
         return sorted(self.tab_info.keys())
+
+    async def ensure_agent_tab(self, timeout: float = 15.0) -> int:
+        """Make sure a Showmi-group tab exists and the debugger is attached
+        to it. Reuses any existing agent tab; otherwise asks the extension
+        to create one and waits for the round-trip.
+        """
+        for tab_id in self.tab_info:
+            if tab_id in self.tab_bridges:
+                return tab_id
+        tab_id = await self._control_request("ENSURE_AGENT_TAB", {}, timeout=timeout)
+        return int(tab_id)
 
 
 _proxy = CDPProxy()

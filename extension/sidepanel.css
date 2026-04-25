@@ -683,129 +683,6 @@ body {
 
 
 /* ═══════════════════════════════════════
-   DISCONNECTED BANNER
-   ═══════════════════════════════════════ */
-
-.disconnected-banner {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 12px;
-  padding: 24px 16px;
-  text-align: center;
-  animation: fadeIn var(--duration) var(--ease);
-}
-
-.disconnected-banner.hidden { display: none; }
-
-.disconnected-icon {
-  color: var(--text-dim);
-  opacity: 0.5;
-}
-
-.disconnected-title {
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--text-muted);
-  letter-spacing: 0.3px;
-}
-
-.disconnected-instructions {
-  width: 100%;
-  max-width: 280px;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.disconnected-step {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
-.disconnected-label {
-  font-size: 9px;
-  font-weight: 500;
-  color: var(--text-dim);
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
-}
-
-.disconnected-cmd-wrap {
-  position: relative;
-}
-
-.disconnected-cmd {
-  display: block;
-  padding: 6px 8px;
-  background: var(--bg-elevated);
-  border: 1px dotted var(--border-dot);
-  border-radius: var(--r-sm);
-  font-family: var(--font);
-  font-size: 10px;
-  color: var(--text);
-  cursor: pointer;
-  transition: border-color var(--duration), background var(--duration);
-  word-break: break-all;
-  text-align: left;
-  line-height: 1.5;
-}
-
-.disconnected-cmd:hover {
-  border-color: var(--accent);
-  background: var(--accent-dim);
-}
-
-.copied-badge {
-  position: absolute;
-  top: -6px;
-  right: 6px;
-  padding: 1px 5px;
-  background: var(--success);
-  color: var(--on-accent);
-  font-family: var(--font);
-  font-size: 8px;
-  font-weight: 600;
-  border-radius: var(--r-sm);
-  opacity: 0;
-  transform: translateY(2px);
-  transition: opacity var(--duration), transform var(--duration);
-  pointer-events: none;
-}
-
-.disconnected-cmd-wrap.copied .copied-badge {
-  opacity: 1;
-  transform: translateY(0);
-}
-
-.disconnected-cmd-wrap.copied .disconnected-cmd {
-  border-color: var(--success);
-}
-
-.disconnected-divider {
-  font-size: 9px;
-  color: var(--text-dim);
-  position: relative;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.disconnected-divider::before,
-.disconnected-divider::after {
-  content: "";
-  flex: 1;
-  height: 0;
-  border-top: 1px dotted var(--border-dot);
-}
-
-.disconnected-retry {
-  margin-top: 4px;
-}
-
-
-/* ═══════════════════════════════════════
    MESSAGES / CHAT AREA
    ═══════════════════════════════════════ */
 
@@ -843,19 +720,139 @@ body {
   gap: 8px;
   color: var(--text-dim);
 }
-.empty-icon { opacity: 0.85; display: flex; align-items: center; justify-content: center; }
+.empty-icon { opacity: 0.9; display: flex; align-items: center; justify-content: center; }
 .empty-logo {
   width: 64px;
   height: 64px;
   object-fit: contain;
-  /* Source PNG has no alpha — drop the white-ish background so it sits on
-     the panel cleanly. mix-blend-mode multiply works on light themes;
-     screen works on dark. The data-theme attr picks the right one. */
   border-radius: 12px;
+  /* Source PNG has no alpha. In light mode, multiply lets the near-white
+     margins dissolve into the lavender bg. In dark mode, no blend works
+     cleanly with this PNG; the margins read as a soft card until a
+     transparent version is dropped in. */
 }
 [data-theme="light"] .empty-logo { mix-blend-mode: multiply; }
-[data-theme="dark"]  .empty-logo { mix-blend-mode: screen; }
-.empty-state p { font-size: 11px; letter-spacing: 0.3px; }
+.empty-ready-text { font-size: 11px; letter-spacing: 0.3px; }
+
+/* Setup-mode: shown when the server isn't connected. Three numbered steps,
+   minimal styling — small monospace commands the user can click to copy. */
+.empty-setup {
+  display: none;
+  list-style: none;
+  padding: 0;
+  margin: 4px 0 0;
+  width: 100%;
+  max-width: 280px;
+  display: none;            /* hidden by default; revealed by data-mode */
+  flex-direction: column;
+  gap: 10px;
+}
+
+.empty-setup li {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.empty-step-num {
+  flex-shrink: 0;
+  width: 16px;
+  height: 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg-elevated);
+  border: 1px dotted var(--border-dot);
+  border-radius: 50%;
+  font-size: 9px;
+  font-weight: 600;
+  color: var(--text-muted);
+  margin-top: 1px;
+}
+
+.empty-step-body {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  flex: 1;
+  min-width: 0;
+}
+
+.empty-step-label {
+  font-size: 9px;
+  font-weight: 500;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.empty-step-cmd {
+  display: block;
+  padding: 5px 7px;
+  background: var(--bg-elevated);
+  border: 1px dotted var(--border-dot);
+  border-radius: var(--r-sm);
+  font-family: var(--font);
+  font-size: 10px;
+  color: var(--text);
+  cursor: pointer;
+  transition: border-color var(--duration), background var(--duration);
+  word-break: break-all;
+  text-align: left;
+  line-height: 1.45;
+  position: relative;
+}
+
+.empty-step-cmd:hover {
+  border-color: var(--accent);
+  background: var(--accent-dim);
+}
+
+.empty-step-cmd.copied {
+  border-color: var(--success);
+}
+
+.empty-step-cmd.copied::after {
+  content: "copied";
+  position: absolute;
+  top: -6px;
+  right: 6px;
+  padding: 1px 5px;
+  background: var(--success);
+  color: var(--on-accent);
+  font-size: 8px;
+  font-weight: 600;
+  border-radius: var(--r-sm);
+}
+
+.empty-step-hint {
+  font-size: 10px;
+  color: var(--text-muted);
+  line-height: 1.45;
+}
+
+.empty-retry {
+  display: none;
+  margin-top: 4px;
+  padding: 5px 14px;
+  background: transparent;
+  border: 1px dotted var(--border-dot);
+  border-radius: var(--r-sm);
+  font-family: var(--font);
+  font-size: 10px;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: color var(--duration), border-color var(--duration);
+}
+.empty-retry:hover {
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+/* Mode switch — driven by [data-mode] on .empty-state. */
+.empty-state[data-mode="setup"] .empty-ready-text { display: none; }
+.empty-state[data-mode="setup"] .empty-setup     { display: flex; }
+.empty-state[data-mode="setup"] .empty-retry     { display: inline-block; }
 
 /* Messages */
 .message {

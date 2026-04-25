@@ -162,43 +162,37 @@
     </div>
   </div>
 
-  <!-- ── Disconnected banner ── -->
-  <div id="disconnected-banner" class="disconnected-banner hidden">
-    <div class="disconnected-icon">
-      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-        <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
-      </svg>
-    </div>
-    <div class="disconnected-title">server not connected</div>
-    <div class="disconnected-instructions">
-      <div class="disconnected-step">
-        <span class="disconnected-label">start the server</span>
-        <div class="disconnected-cmd-wrap">
-          <code class="disconnected-cmd" title="Click to copy">showmi start</code>
-          <span class="copied-badge">copied</span>
-        </div>
-      </div>
-      <div class="disconnected-divider">or</div>
-      <div class="disconnected-step">
-        <span class="disconnected-label">not installed?</span>
-        <div class="disconnected-cmd-wrap">
-          <code class="disconnected-cmd" title="Click to copy">curl -fsSL https://raw.githubusercontent.com/AniruddhS24/self-learning-browseruse/main/install.sh | sh</code>
-          <span class="copied-badge">copied</span>
-        </div>
-      </div>
-    </div>
-    <div class="disconnected-retry">
-      <button id="retry-connect-btn" class="btn btn-ghost">retry connection</button>
-    </div>
-  </div>
-
   <!-- ── Main content ── -->
   <main id="messages">
-    <div class="empty-state" id="empty-state">
+    <div class="empty-state" id="empty-state" data-mode="ready">
       <div class="empty-icon">
         <img src="showmilogo.png" alt="Showmi" class="empty-logo" />
       </div>
-      <p>describe a task to begin</p>
+      <p class="empty-ready-text">describe a task to begin</p>
+      <ol class="empty-setup">
+        <li>
+          <span class="empty-step-num">1</span>
+          <div class="empty-step-body">
+            <span class="empty-step-label">install</span>
+            <code class="empty-step-cmd" title="Click to copy">curl -fsSL https://raw.githubusercontent.com/AniruddhS24/showmi/main/install.sh | sh</code>
+          </div>
+        </li>
+        <li>
+          <span class="empty-step-num">2</span>
+          <div class="empty-step-body">
+            <span class="empty-step-label">start the server</span>
+            <code class="empty-step-cmd" title="Click to copy">showmi start</code>
+          </div>
+        </li>
+        <li>
+          <span class="empty-step-num">3</span>
+          <div class="empty-step-body">
+            <span class="empty-step-label">configure a model</span>
+            <span class="empty-step-hint">tap the model selector below once connected</span>
+          </div>
+        </li>
+      </ol>
+      <button class="empty-retry" id="empty-retry">retry connection</button>
     </div>
   </main>
 

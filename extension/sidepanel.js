@@ -51,9 +51,8 @@ const workflowsDrawer = document.getElementById("workflows-drawer");
 const workflowsClose = document.getElementById("workflows-close");
 const workflowsList = document.getElementById("workflows-list");
 
-// Disconnected banner
-const disconnectedBanner = document.getElementById("disconnected-banner");
-const retryConnectBtn = document.getElementById("retry-connect-btn");
+// Retry button inside the empty-state setup view
+const emptyRetryBtn = document.getElementById("empty-retry");
 
 // Inline attach error
 const attachError = document.getElementById("attach-error");
@@ -496,16 +495,20 @@ function setStatus(state) {
   statusEl.title = state.charAt(0).toUpperCase() + state.slice(1);
 }
 
+function setEmptyStateMode(mode) {
+  // mode: "ready" | "setup". When the server is unreachable we flip the
+  // empty-state into "setup" so the user sees install/start instructions
+  // instead of "describe a task to begin".
+  if (!emptyStateEl) return;
+  emptyStateEl.dataset.mode = mode;
+}
+
 function showDisconnectedBanner() {
-  disconnectedBanner.classList.remove("hidden");
-  messagesEl.style.display = "none";
-  document.getElementById("input-area").style.display = "none";
+  setEmptyStateMode("setup");
 }
 
 function hideDisconnectedBanner() {
-  disconnectedBanner.classList.add("hidden");
-  messagesEl.style.display = "";
-  document.getElementById("input-area").style.display = "";
+  setEmptyStateMode("ready");
 }
 
 function connectSSE(sessionId) {
@@ -539,23 +542,24 @@ async function checkServerHealth() {
     if (res.ok) { setStatus("connected"); hideDisconnectedBanner(); return true; }
   } catch {}
   setStatus("disconnected");
+  showDisconnectedBanner();
   return false;
 }
 
 // ── Retry + copy commands ──
-retryConnectBtn.addEventListener("click", async () => {
-  hideDisconnectedBanner();
-  if (await checkServerHealth()) {
-    if (currentSessionId) connectSSE(currentSessionId);
-  }
-});
+if (emptyRetryBtn) {
+  emptyRetryBtn.addEventListener("click", async () => {
+    if (await checkServerHealth()) {
+      if (currentSessionId) connectSSE(currentSessionId);
+    }
+  });
+}
 
-document.querySelectorAll(".disconnected-cmd").forEach((el) => {
+document.querySelectorAll(".empty-step-cmd").forEach((el) => {
   el.addEventListener("click", () => {
-    const wrap = el.closest(".disconnected-cmd-wrap");
     navigator.clipboard.writeText(el.textContent.trim()).then(() => {
-      wrap.classList.add("copied");
-      setTimeout(() => wrap.classList.remove("copied"), 1500);
+      el.classList.add("copied");
+      setTimeout(() => el.classList.remove("copied"), 1500);
     });
   });
 });
@@ -715,18 +719,8 @@ async function sendMessage() {
   autoResizeInput();
   showThinking();
 
-  // Showmi runs in its own Chrome tab group, never on the user's tabs. Make
-  // sure the group + an attached tab exist before the agent starts.
-  if (currentMode !== "planning") {
-    try {
-      await ensureAgentTab();
-    } catch (err) {
-      removeThinking();
-      addMessage("error", `Attach failed: ${err.message}`);
-      updateInputState();
-      return;
-    }
-  }
+  // The Showmi tab group is created lazily on the server side at the moment
+  // a browser task actually starts. Plain chat messages don't open it.
 
   if (currentMode === "planning") {
     await fetch(`${API_BASE}/api/sessions/${currentSessionId}/planning/respond`, {
@@ -1261,14 +1255,8 @@ async function loadWorkflows() {
         const text = `Run workflow: ${wf.name}`;
         addMessage("user", text);
         showThinking();
-        // Workflows run inside the Showmi tab group, on a fresh tab if needed.
-        try {
-          await ensureAgentTab();
-        } catch (err) {
-          removeThinking();
-          addMessage("error", `Attach failed: ${err.message}`);
-          return;
-        }
+        // Workflows run inside the Showmi tab group; the server creates it
+        // when the run actually starts.
         try {
           const r = await fetch(`${API_BASE}/api/chat`, {
             method: "POST",
@@ -1688,31 +1676,6 @@ function showAttachError(text) {
     attachError.textContent = text;
     attachError.classList.remove("hidden");
   }
-}
-
-async function registerAttachedTabWithServer(tabId) {
-  const r = await fetch(`${API_BASE}/api/session/attach`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ tab_id: tabId }),
-  });
-  if (!r.ok) {
-    const data = await r.json().catch(() => ({}));
-    throw new Error(data.error || `Server rejected attach (${r.status})`);
-  }
-}
-
-// Make sure the Showmi tab group exists and there's an attached agent tab in
-// it, then return that tab's id. Reused across chat and workflow flows so the
-// agent always operates inside its own group, never on the user's tabs.
-async function ensureAgentTab() {
-  showAttachError("");
-  const resp = await new Promise((resolve) => {
-    chrome.runtime.sendMessage({ type: "ENSURE_AGENT_TAB" }, resolve);
-  });
-  if (!resp || !resp.ok) throw new Error(resp?.error || "Attach failed.");
-  await registerAttachedTabWithServer(resp.tabId);
-  return resp.tabId;
 }
 
 // ── Init ──
